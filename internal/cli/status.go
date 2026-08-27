@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/gexqin/wgmgt/internal/humanize"
+	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/wgctl"
 )
 
@@ -32,14 +33,8 @@ var statusCmd = &cobra.Command{
 		}
 
 		out := cmd.OutOrStdout()
-		up := wgctl.Exists(name)
-		state := "down"
-		if up {
-			state = "up"
-		}
-		fmt.Fprintf(out, "%s: %s, %s, port %d, %d peers\n",
-			ifc.Name, state, ifc.Address, ifc.ListenPort, len(peers))
-		if !up {
+		fmt.Fprintln(out, describeInterface(ifc, len(peers)))
+		if !wgctl.Exists(name) {
 			return nil
 		}
 
@@ -59,6 +54,17 @@ var statusCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// describeInterface renders the one-line summary used by status, delete,
+// and init (live up/down from the kernel, the rest from the DB).
+func describeInterface(ifc *store.Interface, peers int) string {
+	state := "down"
+	if wgctl.Exists(ifc.Name) {
+		state = "up"
+	}
+	return fmt.Sprintf("%s: %s, %s, port %d, %d peers",
+		ifc.Name, state, ifc.Address, ifc.ListenPort, peers)
 }
 
 func orDash(s string) string {

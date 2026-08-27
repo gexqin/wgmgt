@@ -29,6 +29,7 @@ sudo wgmgt init                     # wizard: create an interface
 sudo wgmgt peer add --name laptop   # generates keys, prints client conf
 sudo wgmgt up                       # native netlink bring-up
 sudo wgmgt status                   # handshakes and traffic
+sudo wgmgt delete                   # tear down + remove an interface
 
 sudo wgmgt web                        # embedded web UI (token-protected)
 sudo wgmgt server                     # controller: mTLS agent API + web console

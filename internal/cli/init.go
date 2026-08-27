@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"strconv"
@@ -46,8 +47,15 @@ var initCmd = &cobra.Command{
 		if !store.ValidIfaceName(name) {
 			return fmt.Errorf("invalid interface name %q (max 15 chars, [a-zA-Z0-9_-])", name)
 		}
-		if _, err := st.GetInterface("", name); err == nil {
-			return fmt.Errorf("interface %q already exists", name)
+		if existing, err := st.GetInterface("", name); err == nil {
+			if err := offerDeleteExisting(cmd, st, existing); err != nil {
+				if errors.Is(err, errKeepExisting) {
+					return nil
+				}
+				return err
+			}
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return err
 		}
 
 		address := initFlags.address
@@ -97,6 +105,26 @@ var initCmd = &cobra.Command{
 		fmt.Fprintf(out, "\nNext: `wgmgt peer add %s` then `sudo wgmgt up %s`\n", name, name)
 		return nil
 	},
+}
+
+// offerDeleteExisting is called from init when the chosen name is already
+// managed by wgmgt. The user can delete the old config and re-initialize
+// (init then continues its wizard with a clean slate), or keep it (init
+// exits with next-step hints). Non-interactive runs keep it — same safety
+// default as before, when init simply refused.
+func offerDeleteExisting(cmd *cobra.Command, st *store.Store, ifc *store.Interface) error {
+	peers, err := st.ListPeers("", ifc.Name)
+	if err != nil {
+		return err
+	}
+	out := cmd.OutOrStdout()
+	fmt.Fprintf(out, "\nInterface %q is already managed by wgmgt:\n  %s\n", ifc.Name, describeInterface(ifc, len(peers)))
+	if !confirm("Delete it and re-initialize?", false) {
+		fmt.Fprintf(out, "Keeping it. Next: `wgmgt peer add %s` then `sudo wgmgt up %s` (or `wgmgt delete %s` to remove it)\n",
+			ifc.Name, ifc.Name, ifc.Name)
+		return errKeepExisting
+	}
+	return removeInterface(cmd, st, ifc)
 }
 
 // offerStopForeignWG warns about WireGuard devices that are up but not
