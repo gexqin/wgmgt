@@ -1,0 +1,4 @@
+/wgmgt
+/dist/
+*.test
+*.out
