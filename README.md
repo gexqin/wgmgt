@@ -1,6 +1,7 @@
 # WGMGT
 
 [![Status: M1](https://img.shields.io/badge/status-M1-blue)](docs/PLAN.md)
+[![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm--NC--1.0.0-orange)](LICENSE)
 
 An open-source helper tool for deploying, managing, and visualizing
 [kernel WireGuard](https://www.wireguard.com/) — from standard Linux servers
@@ -38,3 +39,10 @@ M1 — single-host CLI loop complete (interface/peer lifecycle, SQLite
 storage, wg-quick conf generation, native netlink up/down, live status).
 End-to-end handshake verified. See the [roadmap](docs/PLAN.md) for what's
 next (web UI, server+agent, router packages).
+
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE) — source-available for any
+**noncommercial** purpose (personal, research, education, charities,
+government). Commercial use is not permitted. Note this makes the project
+source-available rather than OSI "open source" by definition.
