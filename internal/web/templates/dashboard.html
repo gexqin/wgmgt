@@ -1,0 +1,22 @@
+{{define "content"}}
+<h1>Interfaces</h1>
+{{if not .Cards}}
+<p class="empty">No interfaces yet. Create one with <code>sudo wgmgt init</code>.</p>
+{{else}}
+<div class="cards">
+{{range .Cards}}
+  <div class="card">
+    <div class="card-head">
+      <a class="card-title" href="{{u "iface" .Name}}">{{.Name}}</a>
+      <span class="state {{if .Up}}up{{else}}down{{end}}">{{if .Up}}● UP{{else}}○ DOWN{{end}}</span>
+    </div>
+    <dl class="card-meta">
+      <div><dt>address</dt><dd><code>{{.Address}}</code></dd></div>
+      <div><dt>port</dt><dd>{{.Port}}</dd></div>
+      <div><dt>peers</dt><dd>{{.Peers}}</dd></div>
+    </dl>
+  </div>
+{{end}}
+</div>
+{{end}}
+{{end}}

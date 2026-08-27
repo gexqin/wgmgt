@@ -5,6 +5,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gexqin/wgmgt/internal/humanize"
 	"github.com/gexqin/wgmgt/internal/wgctl"
 )
 
@@ -52,8 +53,8 @@ var statusCmd = &cobra.Command{
 				continue // configured in DB but not applied to the device
 			}
 			fmt.Fprintf(out, "  %-12s handshake %-6s rx %-8s tx %-8s %s\n",
-				p.Name, humanDuration(timeSince(s.LastHandshake)),
-				humanBytes(s.Rx), humanBytes(s.Tx),
+				p.Name, humanize.Duration(humanize.Since(s.LastHandshake)),
+				humanize.Bytes(s.Rx), humanize.Bytes(s.Tx),
 				orDash(s.Endpoint))
 		}
 		return nil

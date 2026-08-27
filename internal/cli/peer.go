@@ -10,6 +10,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/gexqin/wgmgt/internal/confgen"
+	"github.com/gexqin/wgmgt/internal/humanize"
 	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/wgctl"
 )
@@ -39,6 +40,7 @@ var peerAddCmd = &cobra.Command{
 			return err
 		}
 		defer st.Close()
+		a := newApp(st)
 		name, err := resolveIface(st, arg(args))
 		if err != nil {
 			return err
@@ -53,7 +55,7 @@ var peerAddCmd = &cobra.Command{
 
 		allowedIPs := peerAddFlags.allowedIPs
 		if allowedIPs == "" {
-			allowedIPs, err = nextFreeIP(st, ifc)
+			allowedIPs, err = a.NextFreeIP(ifc)
 			if err != nil {
 				return err
 			}
@@ -108,7 +110,7 @@ var peerAddCmd = &cobra.Command{
 		if err := st.AddPeer(p); err != nil {
 			return fmt.Errorf("store peer: %w", err)
 		}
-		if err := syncConf(st, name); err != nil {
+		if err := a.SyncConf(name); err != nil {
 			return err
 		}
 
@@ -174,7 +176,7 @@ var peerListCmd = &cobra.Command{
 			liveCol := "-"
 			if s, ok := live[p.PublicKey]; ok {
 				liveCol = fmt.Sprintf("%s / %s / %s",
-					humanDuration(timeSince(s.LastHandshake)), humanBytes(s.Rx), humanBytes(s.Tx))
+					humanize.Duration(humanize.Since(s.LastHandshake)), humanize.Bytes(s.Rx), humanize.Bytes(s.Tx))
 			}
 			fmt.Fprintf(out, "%-3d %-12s %-14s %-24s %s\n",
 				p.ID, p.Name, shortKey(p.PublicKey), p.AllowedIPs, liveCol)
@@ -197,7 +199,7 @@ var peerRmCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if err := syncConf(st, args[0]); err != nil {
+		if err := newApp(st).SyncConf(args[0]); err != nil {
 			return err
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "peer %q removed\n", p.Name)
@@ -249,42 +251,10 @@ func init() {
 	rootCmd.AddCommand(peerCmd)
 }
 
-// nextFreeIP picks the next unused host address in the interface's tunnel
-// subnet (IPv4 only; IPv6 interfaces must use --allowed-ips).
-func nextFreeIP(st *store.Store, ifc *store.Interface) (string, error) {
-	prefix, err := netip.ParsePrefix(ifc.Address)
-	if err != nil {
-		return "", fmt.Errorf("interface address %q: %w", ifc.Address, err)
-	}
-	addr := prefix.Addr()
-	if !addr.Is4() {
-		return "", fmt.Errorf("automatic IP assignment needs an IPv4 tunnel; pass --allowed-ips")
-	}
-	peers, err := st.ListPeers(ifc.Name)
-	if err != nil {
-		return "", err
-	}
-	used := map[netip.Addr]bool{addr: true}
-	for _, p := range peers {
-		for _, s := range strings.Split(p.AllowedIPs, ",") {
-			if a, err := netip.ParseAddr(strings.TrimSpace(strings.TrimSuffix(s, "/32"))); err == nil {
-				used[a] = true
-			}
-		}
-	}
-	base := addr.As4()
-	for i := 2; i < 255; i++ {
-		cand := netip.AddrFrom4([4]byte{base[0], base[1], base[2], byte(i)})
-		if !used[cand] {
-			return netip.PrefixFrom(cand, 32).String(), nil
-		}
-	}
-	return "", fmt.Errorf("tunnel subnet %s is full; pass --allowed-ips", prefix.Masked())
-}
-
 func shortKey(pub string) string {
 	if len(pub) <= 12 {
 		return pub
 	}
 	return pub[:8] + "…" + pub[len(pub)-3:]
 }
+

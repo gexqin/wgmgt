@@ -1,0 +1,19 @@
+{{define "base"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WGMGT</title>
+<link rel="stylesheet" href="{{u "static/wgmgt.css"}}">
+<script src="{{u "static/htmx.min.js"}}" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="{{u}}">WGMGT</a>
+  <span class="tagline">kernel WireGuard manager</span>
+</header>
+<main class="container">
+{{template "content" .}}
+</main>
+</body>
+</html>{{end}}

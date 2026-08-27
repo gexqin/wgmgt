@@ -1,6 +1,6 @@
 # WGMGT
 
-[![Status: M1](https://img.shields.io/badge/status-M1-blue)](docs/PLAN.md)
+[![Status: M2](https://img.shields.io/badge/status-M2-blue)](docs/PLAN.md)
 [![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm--NC--1.0.0-orange)](LICENSE)
 
 An open-source helper tool for deploying, managing, and visualizing
@@ -30,15 +30,19 @@ sudo wgmgt peer add --name laptop   # generates keys, prints client conf
 sudo wgmgt up                       # native netlink bring-up
 sudo wgmgt status                   # handshakes and traffic
 
+sudo wgmgt web                        # embedded web UI (token-protected)
+
 wgmgt doctor                        # check kernel WireGuard compatibility
 ```
 
 ## Status
 
-M1 — single-host CLI loop complete (interface/peer lifecycle, SQLite
-storage, wg-quick conf generation, native netlink up/down, live status).
-End-to-end handshake verified. See the [roadmap](docs/PLAN.md) for what's
-next (web UI, server+agent, router packages).
+M2 — single-host CLI loop and embedded web UI complete. The web UI
+(HTMX, zero frontend build chain) shows interfaces, live handshakes and
+traffic, and manages peers with wizard-style forms; it is protected by a
+per-run random token embedded in the URL and listens on loopback by
+default. See the [roadmap](docs/PLAN.md) for what's next (server+agent,
+router packages).
 
 ## License
 

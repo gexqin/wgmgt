@@ -80,7 +80,7 @@ var initCmd = &cobra.Command{
 		if err := st.CreateInterface(ifc); err != nil {
 			return fmt.Errorf("store interface: %w", err)
 		}
-		if err := syncConf(st, name); err != nil {
+		if err := newApp(st).SyncConf(name); err != nil {
 			return err
 		}
 

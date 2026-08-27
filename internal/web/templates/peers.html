@@ -1,0 +1,30 @@
+{{define "peers"}}
+{{if not .Peers}}
+<p class="empty">No peers yet.</p>
+{{else}}
+<table>
+  <thead><tr>
+    <th>name</th><th>allowed IPs</th><th>endpoint</th>
+    <th class="num">handshake</th><th class="num">rx</th><th class="num">tx</th><th></th>
+  </tr></thead>
+  <tbody>
+  {{range .Peers}}
+    <tr>
+      <td>{{.Peer.Name}}</td>
+      <td><code>{{.Peer.AllowedIPs}}</code></td>
+      <td>{{if .Live}}{{orDash .Live.Endpoint}}{{else}}<code>{{orDash .Peer.Endpoint}}</code>{{end}}</td>
+      <td class="num">{{if .Live}}{{.Ago}}{{else}}–{{end}}</td>
+      <td class="num">{{if .Live}}{{.Rx}}{{else}}–{{end}}</td>
+      <td class="num">{{if .Live}}{{.Tx}}{{else}}–{{end}}</td>
+      <td class="row-actions">
+        <a class="btn small" href="{{u "iface" $.Iface.Name "peers" .Peer.Name "conf"}}">conf</a>
+        <form method="post" action="{{u "iface" $.Iface.Name "peers" .Peer.Name "rm"}}">
+          <button class="btn small danger">rm</button>
+        </form>
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+{{end}}

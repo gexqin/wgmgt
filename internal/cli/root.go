@@ -7,9 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/gexqin/wgmgt/internal/confgen"
+	"github.com/gexqin/wgmgt/internal/app"
 	"github.com/gexqin/wgmgt/internal/store"
-	"github.com/gexqin/wgmgt/internal/wgctl"
 )
 
 const (
@@ -53,6 +52,11 @@ func openStore() (*store.Store, error) {
 	return store.Open(dbPath)
 }
 
+// newApp wires the store to the conf output directory.
+func newApp(st *store.Store) *app.App {
+	return &app.App{Store: st, ConfDir: confDir}
+}
+
 func confPath(name string) string { return filepath.Join(confDir, name+".conf") }
 
 // resolveIface picks the interface to operate on: the argument if given,
@@ -83,31 +87,6 @@ func resolveIface(st *store.Store, arg string) (string, error) {
 		}
 		return "", fmt.Errorf("multiple interfaces (%s); specify one", names)
 	}
-}
-
-// syncConf regenerates the wg-quick conf for an interface after a change and
-// hot-applies the peer list if the device is currently up.
-func syncConf(st *store.Store, name string) error {
-	ifc, err := st.GetInterface(name)
-	if err != nil {
-		return err
-	}
-	peers, err := st.ListPeers(name)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(confDir, 0o700); err != nil {
-		return err
-	}
-	if err := os.WriteFile(confPath(name), []byte(confgen.Interface(ifc, peers)), 0o600); err != nil {
-		return fmt.Errorf("write conf: %w", err)
-	}
-	if wgctl.Exists(name) {
-		if err := wgctl.ApplyPeers(ifc, peers); err != nil {
-			return fmt.Errorf("hot-apply to running device: %w", err)
-		}
-	}
-	return nil
 }
 
 // requireRoot returns a friendly error when not running as root.

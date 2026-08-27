@@ -1,0 +1,46 @@
+{{define "content"}}
+<h1>{{.Iface.Name}}
+  <span class="state {{if .Up}}up{{else}}down{{end}}">{{if .Up}}● UP{{else}}○ DOWN{{end}}</span>
+</h1>
+
+<div class="actions">
+  {{if .Up}}
+  <form method="post" action="{{u "iface" .Iface.Name "down"}}"><button class="btn">Down</button></form>
+  {{else}}
+  <form method="post" action="{{u "iface" .Iface.Name "up"}}"><button class="btn primary">Up</button></form>
+  {{end}}
+</div>
+
+<div class="tiles">
+  <div class="tile"><span class="tile-num">{{.Iface.Address}}</span><span class="tile-label">tunnel address</span></div>
+  <div class="tile"><span class="tile-num">{{.Iface.ListenPort}}</span><span class="tile-label">listen port</span></div>
+  <div class="tile"><span class="tile-num">{{len .Peers}}</span><span class="tile-label">peers</span></div>
+  <div class="tile"><span class="tile-num">{{.Rx}}</span><span class="tile-label">received (live)</span></div>
+  <div class="tile"><span class="tile-num">{{.Tx}}</span><span class="tile-label">sent (live)</span></div>
+</div>
+
+<section>
+<h2>Peers</h2>
+<div id="peers" hx-get="{{u "iface" .Iface.Name "peers-table"}}" hx-trigger="every 5s" hx-swap="innerHTML">
+{{template "peers" .}}
+</div>
+</section>
+
+<section>
+<h2>Add peer</h2>
+<form class="grid-form" method="post" action="{{u "iface" .Iface.Name "peers"}}">
+  <label>Name <input name="name" required placeholder="laptop"></label>
+  <label>Server endpoint <input name="server_endpoint" placeholder="vpn.example.com:{{.Iface.ListenPort}}"></label>
+  <details class="advanced">
+    <summary>Advanced</summary>
+    <div class="advanced-grid">
+      <label>Allowed IPs <input name="allowed_ips" placeholder="auto: next free /32"></label>
+      <label>Peer endpoint <input name="endpoint" placeholder="host:port (roaming peers: empty)"></label>
+      <label>Keepalive seconds <input name="keepalive" type="number" min="0" value="0"></label>
+      <label class="check"><input type="checkbox" name="preshared_key" value="1"> Generate preshared key</label>
+    </div>
+  </details>
+  <div><button class="btn primary" type="submit">Add peer</button></div>
+</form>
+</section>
+{{end}}

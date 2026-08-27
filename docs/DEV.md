@@ -30,16 +30,28 @@ GOOS=linux GOARCH=arm   go build -o wgmgt-linux-armv7 ./cmd/wgmgt
 wgmgt/
 ├── cmd/wgmgt/          # main 入口,只做 cli.Execute()
 ├── internal/
-│   ├── cli/            # cobra 命令树:init/up/down/peer/status/doctor/version
+│   ├── app/            # CLI 与 Web 共享的编排:SyncConf、NextFreeIP
+│   ├── cli/            # cobra 命令树:init/up/down/peer/status/web/doctor/version
 │   ├── confgen/        # wg-quick 兼容 conf 渲染(服务端 + 客户端)
+│   ├── humanize/       # 时长/字节的人类可读格式化
 │   ├── store/          # SQLite 存储(modernc.org/sqlite,纯 Go 无 CGO)
+│   ├── web/            # 内嵌 Web UI(go:embed 模板+静态资源,token 鉴权)
 │   ├── wgctl/          # netlink 应用层:up/down/热应用/状态读取
 │   └── wgkern/         # 内核 WireGuard 检测
 └── docs/               # 本文档
 ```
 
-分层原则:`cli` 层只做参数解析与输出格式化,业务逻辑放 `internal/*`
-领域包中,保证逻辑可单测(命令处理函数不写测试,领域包写)。
+分层原则:`cli`/`web` 层只做参数/请求解析与呈现,业务逻辑放
+`internal/*` 领域包中,保证可单测(命令处理函数不写测试,领域包写)。
+
+## Web UI 要点
+
+- **鉴权模型**:随机 token 嵌入 URL 前缀(`/t/<token>/`),错 token
+  一律 404。没有 cookie/登录页——令牌即 URL,泄露 URL 即泄露权限。
+- **模板**:每个页面 clone base 后独立解析(stdlib `html/template`),
+  peers 片段单独解析供 htmx 轮询端点复用。
+- **htmx 只做一件事**:peer 表每 5 秒轮询刷新;操作(up/down/表单)
+  都是普通 POST + 303,无 JS 也能用。
 
 ## 关键实现事实
 
