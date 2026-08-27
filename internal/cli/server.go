@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -8,7 +9,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -22,9 +25,11 @@ import (
 const defaultServerDir = "/etc/wireguard/wgmgt/server"
 
 var serverFlags struct {
-	dir     string
-	api     string
-	webAddr string
+	dir       string
+	api       string
+	webPort   int
+	webGlobal bool
+	pollHold  time.Duration
 }
 
 var enrollFlags struct{ out string }
@@ -62,7 +67,10 @@ var serverCmd = &cobra.Command{
 		defer st.Close()
 
 		reports := control.NewReports()
-		api := control.NewAPI(st, reports)
+		api := control.NewAPI(st, reports, serverFlags.pollHold)
+		// Every store mutation wakes the node's hanging long-polls, so web
+		// console changes reach agents in milliseconds.
+		st.OnChange = api.Notify
 		apiSrv := api.Server(serverFlags.api, srvCert, caPool)
 
 		webApp := &app.App{Store: st, ConfDir: dir}
@@ -71,23 +79,31 @@ var serverCmd = &cobra.Command{
 			return err
 		}
 
+		// Web console: loopback only unless --web-global opts in.
+		webHost := "127.0.0.1"
+		if serverFlags.webGlobal {
+			webHost = "0.0.0.0"
+		}
+		webAddr := net.JoinHostPort(webHost, strconv.Itoa(serverFlags.webPort))
+
 		errCh := make(chan error, 2)
 		go func() {
 			errCh <- apiSrv.ListenAndServeTLS(filepath.Join(dir, "server.pem"), filepath.Join(dir, "server.key"))
 		}()
 		go func() {
-			errCh <- http.ListenAndServe(serverFlags.webAddr, webSrv.Handler())
+			errCh <- http.ListenAndServe(webAddr, webSrv.Handler())
 		}()
 
 		out := cmd.OutOrStderr()
 		fmt.Fprintf(out, "WGMGT controller\n")
 		fmt.Fprintf(out, "  agent API (mTLS): https://%s\n", displayAddr(serverFlags.api))
-		fmt.Fprintf(out, "  web console:      %s\n", webSrv.URL(serverFlags.webAddr))
-		if host, _, err := net.SplitHostPort(serverFlags.webAddr); err == nil && host != "" && host != "localhost" && host != "127.0.0.1" && host != "::1" {
-			fmt.Fprintf(out, "\nWARNING: the web console is PLAIN HTTP on a non-loopback address.\n"+
+		fmt.Fprintf(out, "  poll hold:        %s\n", serverFlags.pollHold)
+		fmt.Fprintf(out, "  web console:      %s\n", webSrv.URL(webAddr))
+		if serverFlags.webGlobal {
+			fmt.Fprintf(out, "\nWARNING: the web console is PLAIN HTTP on all interfaces (--web-global).\n"+
 				"The URL token (and every client conf it serves, private keys included)\n"+
 				"is readable by anything on the path. Bind a reverse proxy with TLS in\n"+
-				"front, or keep --web on loopback and tunnel in via SSH.\n")
+				"front, or stay on loopback and tunnel in via SSH.\n")
 		}
 
 		sig := make(chan os.Signal, 1)
@@ -95,7 +111,12 @@ var serverCmd = &cobra.Command{
 		select {
 		case s := <-sig:
 			fmt.Fprintf(out, "\nshutting down (%v)\n", s)
-			apiSrv.Close()
+			// Release hanging long-polls first (clean "no change" answers),
+			// then drain in-flight requests; the deadline force-closes the rest.
+			api.WakeAll()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = apiSrv.Shutdown(ctx)
 			return nil
 		case err := <-errCh:
 			return err
@@ -161,7 +182,9 @@ var serverEnrollCmd = &cobra.Command{
 func init() {
 	serverCmd.PersistentFlags().StringVar(&serverFlags.dir, "dir", defaultServerDir, "controller state directory (certs + database)")
 	serverCmd.PersistentFlags().StringVar(&serverFlags.api, "api", ":8443", "mTLS listen address for agents")
-	serverCmd.PersistentFlags().StringVar(&serverFlags.webAddr, "web", "127.0.0.1:8080", "web console listen address")
+	serverCmd.PersistentFlags().IntVar(&serverFlags.webPort, "web", 8080, "web console port")
+	serverCmd.PersistentFlags().BoolVar(&serverFlags.webGlobal, "web-global", false, "web console listens on all interfaces (default loopback only)")
+	serverCmd.PersistentFlags().DurationVar(&serverFlags.pollHold, "poll-hold", 25*time.Second, "max time an agent poll is held waiting for config changes (0 = answer immediately; must stay below the agent's 60s response timeout)")
 	serverEnrollCmd.Flags().StringVar(&enrollFlags.out, "out", ".", "directory to write the agent certificate files into")
 	serverCmd.AddCommand(serverEnrollCmd)
 	rootCmd.AddCommand(serverCmd)

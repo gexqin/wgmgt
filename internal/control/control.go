@@ -1,7 +1,9 @@
 // Package control implements the wgmgt controller's agent-facing API and
 // state. Protocol (per plan decision #13): JSON over TLS with mutual
-// certificate authentication; agents connect outbound and pull their
-// configuration on an interval; the agent certificate CN is the node name.
+// certificate authentication; agents connect outbound via HTTP long-polling
+// (a poll whose version is current is held until the config changes or the
+// hold expires, so changes reach agents in milliseconds); the agent
+// certificate CN is the node name.
 package control
 
 import (
@@ -14,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gexqin/wgmgt/internal/store"
@@ -99,14 +102,71 @@ func (rp *Reports) Get(node string) ReportEntry {
 	return rp.latest[node]
 }
 
-// API is the agent-facing HTTP API behind mTLS.
-type API struct {
-	store   *store.Store
-	reports *Reports
+// Notifier wakes hanging long-polls. Wake closes the node's current
+// generation channel; WakeCh lazily recreates it for the next waiter. The
+// capture-order rule that makes this race-free: a handler must grab WakeCh
+// BEFORE reading the config version — a change after the capture closes the
+// channel (wakes us), a change before the read shows up as version != since.
+type Notifier struct {
+	mu  sync.Mutex
+	gen map[string]chan struct{}
 }
 
-func NewAPI(st *store.Store, reports *Reports) *API {
-	return &API{store: st, reports: reports}
+func NewNotifier() *Notifier { return &Notifier{gen: map[string]chan struct{}{}} }
+
+// Wake releases all current waiters of a node.
+func (n *Notifier) Wake(node string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if ch, ok := n.gen[node]; ok {
+		close(ch)
+		delete(n.gen, node)
+	}
+}
+
+// WakeCh returns the node's current generation channel (created on demand).
+func (n *Notifier) WakeCh(node string) <-chan struct{} {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if ch, ok := n.gen[node]; ok {
+		return ch
+	}
+	ch := make(chan struct{})
+	n.gen[node] = ch
+	return ch
+}
+
+// API is the agent-facing HTTP API behind mTLS.
+type API struct {
+	store    *store.Store
+	reports  *Reports
+	hold     time.Duration
+	notifier *Notifier
+	shutdown atomic.Bool
+}
+
+// NewAPI builds the API. hold is the maximum time a current-version poll is
+// held waiting for changes (<= 0 answers immediately, no long-polling).
+func NewAPI(st *store.Store, reports *Reports, hold time.Duration) *API {
+	return &API{store: st, reports: reports, hold: hold, notifier: NewNotifier()}
+}
+
+// Notify wakes a node's hanging polls; the controller wires the store's
+// OnChange hook to it so every mutation path releases waiting agents.
+func (a *API) Notify(node string) { a.notifier.Wake(node) }
+
+// WakeAll releases every hanging poll (graceful shutdown): handlers answer
+// immediately with the current version — agents reconnect to the new process
+// instead of waiting out the hold or eating a broken connection.
+func (a *API) WakeAll() {
+	a.shutdown.Store(true)
+	nodes, err := a.store.ListNodes()
+	if err != nil {
+		return
+	}
+	for _, n := range nodes {
+		a.notifier.Wake(n.Name)
+	}
 }
 
 // Handler returns the API mux (mount behind mTLS verification).
@@ -127,6 +187,10 @@ func (a *API) Server(addr string, cert tls.Certificate, caPool *x509.CertPool) *
 			ClientCAs:    caPool,
 			MinVersion:   tls.VersionTLS12,
 		},
+		// Deliberately no ReadTimeout/WriteTimeout: they would kill held
+		// long-poll responses. Header and idle times are still bounded.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 }
 
@@ -169,17 +233,46 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 	a.reports.Update(node, req.Status)
 	a.store.TouchNode(node, time.Now().UTC().Format(time.RFC3339))
 
+	// Capture the wake channel BEFORE reading the version (see Notifier):
+	// changes racing this request are caught either by the channel close or
+	// by the version comparison, never by neither.
+	ch := a.notifier.WakeCh(node)
 	version, err := a.store.ConfigVersion(node)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	timer := time.NewTimer(a.hold)
+	defer timer.Stop()
+	timedOut := false
+	for version == req.Since && a.hold > 0 && !timedOut {
+		select {
+		case <-ch: // config changed (or shutdown wake) — re-read and re-check
+			if a.shutdown.Load() {
+				timedOut = true // answer now so agents move to the new process
+				continue
+			}
+			ch = a.notifier.WakeCh(node)
+			if version, err = a.store.ConfigVersion(node); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		case <-timer.C: // hold expired: answer with the current version
+			timedOut = true
+		case <-r.Context().Done(): // client went away — release the goroutine
+			return
+		}
+	}
+
 	resp := struct {
 		Version    int64             `json:"version"`
 		Interfaces *[]AgentInterface `json:"interfaces,omitempty"`
 	}{Version: version}
 
-	if version > req.Since {
+	// "Different", not "greater": deleting the top-version interface lowers
+	// the node's MAX version, and that delete must reach the agent too.
+	if version != req.Since {
 		cfg, err := a.configFor(node)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)

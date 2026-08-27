@@ -21,6 +21,18 @@ var ErrNotFound = errors.New("not found")
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
+
+	// OnChange, when set, is invoked with the node after any mutation that
+	// can change a node's config version. The controller wires it to wake
+	// hanging long-polls; it is nil in CLI/local mode.
+	OnChange func(node string)
+}
+
+// changed fires the OnChange hook (a no-op when unset).
+func (s *Store) changed(node string) {
+	if s.OnChange != nil {
+		s.OnChange(node)
+	}
 }
 
 // Open opens (creating if necessary) the database at path and runs
@@ -160,7 +172,11 @@ func (s *Store) CreateInterface(i *Interface) error {
 	_, err := s.db.Exec(`INSERT INTO interfaces
 		(`+ifaceCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		i.Node, i.Name, i.PrivateKey, i.ListenPort, i.Address, i.MTU, i.DNS, i.RouteTable, i.Fwmark, i.ServerEndpoint, i.PostUp, i.PostDown, i.Enabled, i.ConfigVersion)
-	return err
+	if err != nil {
+		return err
+	}
+	s.changed(i.Node)
+	return nil
 }
 
 func scanIface(row interface{ Scan(...any) error }) (*Interface, error) {
@@ -207,19 +223,30 @@ func (s *Store) DeleteInterface(node, name string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("%w: interface %q", ErrNotFound, name)
 	}
+	// Deleting the top-version interface lowers the node's MAX version —
+	// still a config change agents must see.
+	s.changed(node)
 	return nil
 }
 
 // SetEnabled toggles an interface and bumps its config version so agents
 // pick the change up on their next poll.
 func (s *Store) SetEnabled(node, name string, enabled bool) error {
-	return s.bumpIf("UPDATE interfaces SET enabled = ?, config_version = config_version + 1 WHERE node = ? AND name = ?", enabled, node, name)
+	if err := s.bumpIf("UPDATE interfaces SET enabled = ?, config_version = config_version + 1 WHERE node = ? AND name = ?", enabled, node, name); err != nil {
+		return err
+	}
+	s.changed(node)
+	return nil
 }
 
 // UpdateServerEndpoint sets the public endpoint advertised in client confs.
 func (s *Store) UpdateServerEndpoint(node, name, endpoint string) error {
 	_, err := s.db.Exec("UPDATE interfaces SET server_endpoint = ?, config_version = config_version + 1 WHERE node = ? AND name = ?", endpoint, node, name)
-	return err
+	if err != nil {
+		return err
+	}
+	s.changed(node)
+	return nil
 }
 
 // AddPeer inserts a peer for the given interface.
@@ -232,7 +259,11 @@ func (s *Store) AddPeer(p *Peer) error {
 		return err
 	}
 	p.ID, _ = res.LastInsertId()
-	return s.bump(p.Node, p.Interface)
+	if err := s.bump(p.Node, p.Interface); err != nil {
+		return err
+	}
+	s.changed(p.Node)
+	return nil
 }
 
 // ListPeers returns the peers of an interface (of all interfaces if name is empty).
@@ -287,7 +318,11 @@ func (s *Store) DeletePeer(node, iface, ref string) (*Peer, error) {
 	if _, err := s.db.Exec("DELETE FROM peers WHERE id = ?", p.ID); err != nil {
 		return nil, err
 	}
-	return p, s.bump(node, iface)
+	if err := s.bump(node, iface); err != nil {
+		return nil, err
+	}
+	s.changed(node)
+	return p, nil
 }
 
 // ConfigVersion returns the max config version of a node's interfaces

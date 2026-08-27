@@ -180,3 +180,44 @@ func TestConfigVersionPerNode(t *testing.T) {
 		t.Errorf("n2 version = %d, want 0", v)
 	}
 }
+
+func TestChangeHookFires(t *testing.T) {
+	// The hook is the controller's long-poll wake path: every mutation that
+	// can change a node's config version must fire it with the right node.
+	s := open(t)
+	mustCreate(t, s, "n1", "wg0")
+
+	var got []string
+	s.OnChange = func(node string) { got = append(got, node) }
+
+	s.CreateInterface(&Interface{Node: "n2", Name: "wg0", PrivateKey: "k", Address: "10.0.0.2/24"})
+	s.SetEnabled("n1", "wg0", false)
+	s.UpdateServerEndpoint("n1", "wg0", "vpn.example.com:51820")
+	s.AddPeer(&Peer{Node: "n1", Interface: "wg0", Name: "p", PublicKey: "pub1", AllowedIPs: "10.0.0.3/32"})
+	s.DeletePeer("n1", "wg0", "pub1")
+	s.DeleteInterface("n2", "wg0")
+
+	want := []string{"n2", "n1", "n1", "n1", "n1", "n2"}
+	if len(got) != len(want) {
+		t.Fatalf("hook fired %d times (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("hook call %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+
+	// Registry writes are not config changes — must not fire.
+	got = nil
+	s.EnsureNode("n3", "fp")
+	s.TouchNode("n3", "now")
+	if len(got) != 0 {
+		t.Errorf("registry writes must not fire the hook: %v", got)
+	}
+
+	// Nil hook (CLI/local mode) must be safe.
+	s.OnChange = nil
+	if err := s.SetEnabled("n1", "wg0", true); err != nil {
+		t.Fatal(err)
+	}
+}

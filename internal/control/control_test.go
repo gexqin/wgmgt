@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -54,9 +55,12 @@ func newPKI(t *testing.T, agentName string) pki {
 	return pki{ca: ca, server: srvTLS, pool: pool, agentCert: agTLS, agentFP: fp}
 }
 
-func newAPIServer(t *testing.T, st *store.Store, p pki, reports *Reports) *httptest.Server {
+func newAPIServer(t *testing.T, st *store.Store, p pki, reports *Reports, hold time.Duration) (*httptest.Server, *API) {
 	t.Helper()
-	api := NewAPI(st, reports)
+	api := NewAPI(st, reports, hold)
+	// The controller wires the store hook to the API (see cli/server.go);
+	// mirror it so long-poll tests exercise the real wake path.
+	st.OnChange = api.Notify
 	srv := httptest.NewUnstartedServer(api.Handler())
 	srv.TLS = &tls.Config{
 		Certificates: []tls.Certificate{p.server},
@@ -66,7 +70,7 @@ func newAPIServer(t *testing.T, st *store.Store, p pki, reports *Reports) *httpt
 	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
-	return srv
+	return srv, api
 }
 
 func clientFor(t *testing.T, p pki) *http.Client {
@@ -98,6 +102,32 @@ type pollResp struct {
 	Interfaces *[]AgentInterface `json:"interfaces"`
 }
 
+// pollAsync starts a poll on a goroutine and returns its result channel —
+// the shape long-poll assertions need (nothing arrives until the wake).
+func pollAsync(t *testing.T, c *http.Client, url string, since int64) <-chan pollResult {
+	t.Helper()
+	body, _ := json.Marshal(PollRequest{Since: since, Status: StatusReport{}})
+	ch := make(chan pollResult, 1)
+	go func() {
+		resp, err := c.Post(url+"/api/poll", "application/json", bytes.NewReader(body))
+		if err != nil {
+			ch <- pollResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		var out pollResp
+		json.NewDecoder(resp.Body).Decode(&out)
+		ch <- pollResult{code: resp.StatusCode, resp: out}
+	}()
+	return ch
+}
+
+type pollResult struct {
+	err  error
+	code int
+	resp pollResp
+}
+
 func TestPollPushesConfigAndRecordsReport(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "db"))
 	if err != nil {
@@ -116,7 +146,7 @@ func TestPollPushesConfigAndRecordsReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	reports := NewReports()
-	ts := newAPIServer(t, st, p, reports)
+	ts, _ := newAPIServer(t, st, p, reports, 0)
 	c := clientFor(t, p)
 
 	code, resp := poll(t, c, ts.URL, 0)
@@ -168,7 +198,7 @@ func TestPollRejectsServerCN(t *testing.T) {
 	defer st.Close()
 
 	p := newPKI(t, "wgmgt-server") // forbidden CN
-	ts := newAPIServer(t, st, p, NewReports())
+	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
 	c := clientFor(t, p)
 	code, _ := poll(t, c, ts.URL, 0)
 	if code != http.StatusUnauthorized {
@@ -181,7 +211,7 @@ func TestPollEnforcesFingerprint(t *testing.T) {
 	defer st.Close()
 
 	p := newPKI(t, "n1")
-	ts := newAPIServer(t, st, p, NewReports())
+	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
 	c := clientFor(t, p)
 
 	// Not enrolled at all.
@@ -211,7 +241,7 @@ func TestPollWithoutClientCertRejected(t *testing.T) {
 	st, _ := store.Open(filepath.Join(t.TempDir(), "db"))
 	defer st.Close()
 	p := newPKI(t, "n1")
-	ts := newAPIServer(t, st, p, NewReports())
+	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
 	// Plain client: TLS handshake itself fails (client cert required).
 	c := &http.Client{}
 	if _, err := c.Post(ts.URL+"/api/poll", "application/json", bytes.NewReader([]byte(`{}`))); err == nil {
@@ -225,5 +255,161 @@ func TestPollVerifiesTimeIntervalSanity(t *testing.T) {
 	r.Update("x", StatusReport{})
 	if r.Get("x").When.After(time.Now().Add(time.Minute)) {
 		t.Error("report timestamps must be sane")
+	}
+}
+
+// newLongPollFixture builds a one-interface store + enrolled node + holding
+// API server; the shared setup of the long-poll tests.
+func newLongPollFixture(t *testing.T, hold time.Duration) (*store.Store, *http.Client, string, *API) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.CreateInterface(&store.Interface{Node: "n1", Name: "wg0", PrivateKey: "k", Address: "10.5.0.1/24", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	p := newPKI(t, "n1")
+	if err := st.EnsureNode("n1", p.agentFP); err != nil {
+		t.Fatal(err)
+	}
+	ts, api := newAPIServer(t, st, p, NewReports(), hold)
+	return st, clientFor(t, p), ts.URL, api
+}
+
+func TestLongPollWaitsForChange(t *testing.T) {
+	st, c, url, _ := newLongPollFixture(t, 5*time.Second)
+
+	_, cur := poll(t, c, url, 0) // fetch current version
+	ch := pollAsync(t, c, url, cur.Version)
+
+	select {
+	case r := <-ch:
+		t.Fatalf("current-version poll must be held, got %+v", r)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Any mutation wakes the held poll within milliseconds.
+	if err := st.SetEnabled("n1", "wg0", false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-ch:
+		if r.err != nil || r.code != http.StatusOK {
+			t.Fatalf("woken poll: %v %+v", r.err, r)
+		}
+		if r.resp.Version == cur.Version || r.resp.Interfaces == nil {
+			t.Errorf("woken poll should push the new config: %+v", r.resp)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("poll was not woken by the config change")
+	}
+}
+
+func TestLongPollHoldExpiry(t *testing.T) {
+	_, c, url, _ := newLongPollFixture(t, 100*time.Millisecond)
+
+	_, cur := poll(t, c, url, 0)
+	ch := pollAsync(t, c, url, cur.Version)
+	select {
+	case r := <-ch:
+		if r.err != nil || r.code != http.StatusOK {
+			t.Fatalf("expired poll: %v %+v", r.err, r)
+		}
+		// Hold expiry answers "no change" so the agent re-polls immediately.
+		if r.resp.Version != cur.Version || r.resp.Interfaces != nil {
+			t.Errorf("expired poll should return current version, no config: %+v", r.resp)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("poll did not return after hold expiry")
+	}
+}
+
+func TestLongPollWakesOnVersionDrop(t *testing.T) {
+	st, c, url, _ := newLongPollFixture(t, 5*time.Second)
+
+	// A second interface at v1; wg0 has been bumped to v3 by peer churn.
+	st.SetEnabled("n1", "wg0", false)
+	st.SetEnabled("n1", "wg0", true)
+	if err := st.CreateInterface(&store.Interface{Node: "n1", Name: "wg1", PrivateKey: "k", Address: "10.6.0.1/24", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	v, _ := st.ConfigVersion("n1")
+	if v != 3 {
+		t.Fatalf("setup: version = %d, want 3", v)
+	}
+
+	ch := pollAsync(t, c, url, 3)
+	select {
+	case r := <-ch:
+		t.Fatalf("poll must be held at the current version, got %+v", r)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// Deleting the top-version interface DROPS the node's MAX version; the
+	// poll must still wake and push (version "different", not "greater").
+	if err := st.DeleteInterface("n1", "wg0"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-ch:
+		if r.err != nil || r.resp.Version != 1 || r.resp.Interfaces == nil {
+			t.Fatalf("dropped-version poll: %+v", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("poll was not woken by the version drop")
+	}
+}
+
+func TestLongPollClientCancel(t *testing.T) {
+	_, c, url, _ := newLongPollFixture(t, 5*time.Second)
+
+	_, cur := poll(t, c, url, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	body, _ := json.Marshal(PollRequest{Since: cur.Version, Status: StatusReport{}})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/api/poll", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		resp, err := c.Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // let the request reach the hold loop
+	cancel()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("cancelled poll should report an error to the client")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled poll did not return")
+	}
+}
+
+func TestShutdownWakeAll(t *testing.T) {
+	_, c, url, api := newLongPollFixture(t, 30*time.Second)
+
+	_, cur := poll(t, c, url, 0)
+	ch := pollAsync(t, c, url, cur.Version)
+	select {
+	case r := <-ch:
+		t.Fatalf("poll must be held, got %+v", r)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	api.WakeAll() // graceful shutdown: answer now, agents reconnect elsewhere
+	select {
+	case r := <-ch:
+		if r.err != nil || r.code != http.StatusOK || r.resp.Interfaces != nil {
+			t.Fatalf("wake-all should answer no-change: %+v", r)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("WakeAll did not release the held poll")
 	}
 }

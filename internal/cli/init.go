@@ -54,7 +54,7 @@ var initCmd = &cobra.Command{
 		}
 
 		port := initFlags.port
-		if !cmd.Flags().Changed("port") && port == 0 {
+		if !cmd.Flags().Changed("port") {
 			port, _ = strconv.Atoi(prompt("Listen port", "51820"))
 		}
 		if port < 0 || port > 65535 {

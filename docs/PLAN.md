@@ -23,7 +23,7 @@
 | 10 | WG 控制 | wgctrl(netlink)操作内核;doctor 检测用自写 genl 探测(见 DEV.md) |
 | 11 | 配置存储(2026-08-27 补) | **SQLite 为唯一真相**,`wg-quick` 兼容 conf 是生成产物(改配置 → 写 DB → 重生成 conf → 应用);SQLite 自 M1 单机模式即引入。私钥存 DB,库文件与产物 conf 均 0600;硬件密钥延后 |
 | 12 | Web UI 选型(2026-08-27 补) | **HTMX + 纯静态模板**,零前端构建链,embed 体积最小(M2) |
-| 13 | server↔agent 协议(2026-08-27 定) | **JSON + TLS + mTLS**;agent 主动外连(NAT 后路由器唯一可行方向),pull 模型轮询配置(默认 30s,响应头提示变更可加速);agent 证书即身份,可吊销。gRPC 因路由器体积/内存硬约束被否 |
+| 13 | server↔agent 协议(2026-08-27 定;同日升级长轮询) | **JSON + TLS + mTLS**;agent 主动外连(NAT 后路由器唯一可行方向),pull 模型 **HTTP 长轮询**(hold 25s,store 变更钩子即时唤醒,状态随轮询上报);agent 证书即身份,可吊销。gRPC 因路由器体积/内存硬约束被否 |
 | 14 | 许可证(2026-08-27 定) | **PolyForm Noncommercial 1.0.0**——允许非商业用途(个人/研究/教育/公益/政府),禁止商用。严格说是 source-available 而非 OSI 开源;后果:进不了 OpenWrt 官方源(M4 走侧载/自建源),梅林插件影响较小 |
 
 ### 硬约束的推论
@@ -59,7 +59,7 @@
 | **M0 骨架** | git/go.mod、cobra CLI、`version`、`doctor`(内核 WG 检测) | ✅ 完成(commit e26988a) |
 | **M1 单机 CLI 闭环** | `init` 向导/高级模式、接口 up/down、peer 增删查(含 `--public-key` 导入)、配置持久化(SQLite + conf 生成)、`status` 含流量统计;netns+veth 端到端握手已验证 | ✅ 完成 |
 | **M2 单机 Web UI** | go:embed 内嵌 HTMX UI、接口卡片/统计磁贴/peer 表(5s 刷新)、表单加 peer(向导+高级折叠)、Up/Down、客户端 conf 查看;token-in-URL 鉴权,默认仅监听 127.0.0.1 | ✅ 完成 |
-| **M3 主控 + agent** | 内置 PKI(CA/服务端/agent 证书,`server enroll` 签发)、mTLS poll API(JSON,agent 主动外连)、agent 无状态拉取收敛(conf 生成 + netlink 应用)、状态随轮询上报、控制台 Web(节点总览/建接口/peer 管理/Enable-Disable 期望态);E2E:单机双 agent 跨 netns 经控制台建隧道并握手 | ✅ 完成 |
+| **M3 主控 + agent** | 内置 PKI(CA/服务端/agent 证书,`server enroll` 签发)、mTLS 长轮询 API(JSON,agent 主动外连,变更即时唤醒)、agent 无状态拉取收敛(conf 生成 + netlink 应用)、状态随轮询上报、控制台 Web(节点总览/建接口/peer 管理/Enable-Disable 期望态);E2E:单机双 agent 跨 netns 经控制台建隧道并握手 | ✅ 完成 |
 | **M4 平台适配** | 交叉编译矩阵(amd64/arm64/armv7)、Docker 镜像、OpenWrt ipk、梅林插件包 | 计划 |
 | **M5 发布打磨** | CI/CD、语义化版本、文档站、发布流程 | 计划 |
 

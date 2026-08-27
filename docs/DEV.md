@@ -49,11 +49,17 @@ wgmgt/
 
 ## 控制端 / agent 要点(M3)
 
-- **协议**:POST /api/poll,JSON over mTLS。agent 的证书 CN 即节点名;
-  请求体带 `since`(已应用的配置版本)+ 实时状态;版本落后时响应
-  携带完整期望配置,否则只回版本号(几百字节)。
+- **协议**:POST /api/poll,JSON over mTLS,**HTTP 长轮询**。agent 的
+  证书 CN 即节点名;请求体带 `since`(已应用的配置版本)+ 实时状态。
+  `since` 等于当前版本时服务端挂起至多 `--poll-hold`(默认 25s,0 关闭),
+  直到版本变化(store 变更钩子经 Notifier 即时唤醒)、hold 到期或客户端
+  断开;版本**不同**时(注意不是"更新"——删除接口会使版本**下降**)
+  响应携带完整期望配置,否则只回版本号(几百字节)。agent 每轮完成即
+  立即重发(请求本身就是定时器),失败按 `--interval` 退避;状态随每轮
+  长轮询上报,节奏 ≈ hold。进程外直改 DB 不触发钩子,一个 hold 周期内
+  自愈。
 - **配置版本**:`interfaces.config_version` 每次变更 +1,节点版本取其
-  接口的最大值。agent 只在版本变化时重新应用(避免每 30s 重置 peer
+  接口的最大值。agent 只在版本变化时重新应用(避免重置 peer
   流量计数器)。
 - **agent 无状态**:唯一本地痕迹是 conf 目录(也作为"受管接口集合"
   的记录,重启后据此上报状态)。
@@ -74,8 +80,12 @@ wgmgt/
   隔离(该版本不再重试,直到更新的版本)。已验证配置不受控制端
   后续故障影响(不会误伤)。
 - **两个用血泪换来的实现细节**:
-  1. agent 的 HTTP client 必须有硬超时——黑洞里的 TCP connect 会挂死
-     在 SYN 重传上,卡住整个 Run 循环,看门狗就永远不会被调度;
+  1. agent 的 HTTP client 不能用整体硬超时(会杀掉长轮询的 held 响应),
+     但连接阶段必须有硬超时——黑洞里的 TCP connect 会挂死在 SYN 重传
+     上,卡住整个 Run 循环,看门狗就永远不会被调度。正解是 transport
+     级:DialContext/TLSHandshakeTimeout 各 10s(锁死节点 ~10s 内失败),
+     ResponseHeaderTimeout 60s 兜底沉默的控制端(服务端 `--poll-hold`
+     必须小于它);
   2. 热更 peer 不会重装路由——0/0 加入时若只 ApplyPeers,策略路由
      根本不生效(不会锁,但也"不会生效")。签名比对才是正解。
 

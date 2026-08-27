@@ -80,14 +80,17 @@ func TestQuarantinePersistsAcrossRestart(t *testing.T) {
 	}
 }
 
-func TestQuarantineAllowsNewerVersionOnly(t *testing.T) {
-	// Mirrors the gate in PollOnce: quarantined at v7 means only >7 may apply.
+func TestQuarantineRejectsOnlyTheBadVersion(t *testing.T) {
+	// Mirrors the gate in PollOnce: quarantined at v7 means exactly v7 stays
+	// rejected. Not <=: versions can DROP (deleting the top-version
+	// interface lowers the node's MAX), and a fixed config must be allowed
+	// to carry a lower number — otherwise the node never recovers.
 	a := &Agent{quarantinedVer: 7}
-	rejected := func(v int64) bool { return v <= a.quarantinedVer }
-	if !rejected(7) || !rejected(6) {
-		t.Error("versions <= quarantined must be rejected")
+	rejected := func(v int64) bool { return v == a.quarantinedVer }
+	if !rejected(7) {
+		t.Error("the quarantined version must be rejected")
 	}
-	if rejected(8) {
-		t.Error("versions > quarantined must be allowed")
+	if rejected(6) || rejected(8) {
+		t.Error("other versions must be allowed (lower included — versions can drop)")
 	}
 }

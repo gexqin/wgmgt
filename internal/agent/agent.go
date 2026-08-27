@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,7 +30,7 @@ import (
 type Agent struct {
 	serverURL  string
 	client     *http.Client
-	interval   time.Duration
+	interval   time.Duration // backoff after a failed poll
 	confDir    string
 	appliedVer int64
 
@@ -42,6 +43,7 @@ type Agent struct {
 	verifying      bool
 	pendingSince   time.Time
 	quarantinedVer int64
+	gotConfig      bool                // last poll delivered a config (Run pacing)
 	sigs           map[string]ifaceSig // routing signatures of applied interfaces
 }
 
@@ -60,15 +62,22 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeou
 	a := &Agent{
 		serverURL: strings.TrimSuffix(serverURL, "/"),
 		client: &http.Client{
-			// A hard request timeout matters: a locked-out node's polls hang
-			// on TCP connects that never complete, and the watchdog must
-			// still get scheduled — the Run loop only ticks between polls.
-			Timeout: 10 * time.Second,
-			Transport: &http.Transport{TLSClientConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				RootCAs:      pool,
-				MinVersion:   tls.VersionTLS12,
-			}},
+			// No blanket Timeout: it would abort held long-poll responses.
+			// Instead the phases are bounded individually — dial/handshake
+			// timeouts keep a black-holed (locked-out) node failing in ~10s
+			// so the Run loop keeps scheduling the watchdog, and the header
+			// timeout bounds a silent controller for everyone else. The
+			// server's --poll-hold must stay below it.
+			Transport: &http.Transport{
+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 60 * time.Second,
+				TLSClientConfig: &tls.Config{
+					Certificates: []tls.Certificate{cert},
+					RootCAs:      pool,
+					MinVersion:   tls.VersionTLS12,
+				},
+			},
 		},
 		interval:      interval,
 		verifyTimeout: verifyTimeout,
@@ -79,27 +88,60 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeou
 }
 
 // Run polls until the context is cancelled. The first poll happens
-// immediately (appliedVer 0 forces a full config fetch). The watchdog runs
-// on a short side ticker so a locked-out node still fires on time even
-// with a long poll interval.
+// immediately (appliedVer 0 forces a full config fetch). Each successful
+// long-poll blocks for the server's hold time, so the request itself is the
+// sleep — the agent reconnects instantly, and config changes reach it in
+// milliseconds. The watchdog runs on a short side ticker so a locked-out
+// node still fires on time even while polls fail or back off.
 func (a *Agent) Run(ctx context.Context) error {
-	poll := time.NewTicker(a.interval)
-	defer poll.Stop()
 	watch := time.NewTicker(5 * time.Second)
 	defer watch.Stop()
 	for {
-		if err := a.PollOnce(ctx); err != nil {
+		start := time.Now()
+		err := a.PollOnce(ctx)
+		switch {
+		case err != nil:
 			log.Printf("agent: %v", err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-watch.C:
-			a.checkWatchdog()
-		case <-poll.C:
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-watch.C:
+				a.checkWatchdog()
+			case <-time.After(a.interval): // retry backoff
+			}
+		case a.gotConfig || time.Since(start) >= fastGap:
+			// A pushed config (or a full-length hold) means the server is
+			// long-polling: re-poll immediately, the next request hangs.
+			// Drain a pending watchdog tick so rapid config changes cannot
+			// starve it (it also runs inside the blocking poll's downtime).
+			select {
+			case <-watch.C:
+				a.checkWatchdog()
+			default:
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+			}
+		default:
+			// Fast "no change" answer: the server is not holding (hold=0 or
+			// an old controller) — pace by the backoff interval to avoid a
+			// hot loop, like the old interval-polling agent did.
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-watch.C:
+				a.checkWatchdog()
+			case <-time.After(a.interval):
+			}
 		}
 	}
 }
+
+// fastGap is the minimum round-trip that counts as "the server held the
+// poll". Responses faster than this with no config mean no long-polling.
+const fastGap = 5 * time.Second
 
 // checkWatchdog rolls back an unverified config.
 func (a *Agent) checkWatchdog() {
@@ -164,6 +206,7 @@ func (a *Agent) teardown() {
 // A successful poll also confirms the previously applied config (contact
 // with the controller proves the node is not locked out).
 func (a *Agent) PollOnce(ctx context.Context) error {
+	a.gotConfig = false
 	body, _ := json.Marshal(control.PollRequest{Since: a.appliedVer, Status: a.collectStatus()})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.serverURL+"/api/poll", bytes.NewReader(body))
 	if err != nil {
@@ -186,8 +229,12 @@ func (a *Agent) PollOnce(ctx context.Context) error {
 		return err
 	}
 	if cfg.Interfaces != nil && *cfg.Interfaces != nil {
-		if a.quarantinedVer > 0 && cfg.Version <= a.quarantinedVer {
+		a.gotConfig = true
+		if a.quarantinedVer > 0 && cfg.Version == a.quarantinedVer {
 			// The config that locked us out is still current; stay down.
+			// Exactly equal, not <=: versions can drop (deleting the
+			// top-version interface lowers the node's MAX), and a fixed
+			// config must be allowed to carry a lower number.
 			a.appliedVer = cfg.Version
 		} else if err := a.Apply(*cfg.Interfaces); err != nil {
 			return fmt.Errorf("apply v%d: %w", cfg.Version, err)

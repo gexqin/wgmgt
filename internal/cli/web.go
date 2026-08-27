@@ -2,7 +2,9 @@ package cli
 
 import (
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
 
 	"github.com/spf13/cobra"
 
@@ -10,7 +12,8 @@ import (
 )
 
 var webFlags struct {
-	listen string
+	port   int
+	global bool
 }
 
 var webCmd = &cobra.Command{
@@ -18,7 +21,7 @@ var webCmd = &cobra.Command{
 	Short: "Serve the embedded web UI (token-protected)",
 	Long: "Serve the embedded web UI. The listen URL contains a per-run random " +
 		"token — anyone without that URL gets a 404. Defaults to loopback only; " +
-		"change --listen to expose on a network at your own risk.",
+		"pass --global to expose it on all interfaces at your own risk.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requireRoot(); err != nil {
 			return err
@@ -32,12 +35,21 @@ var webCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(cmd.OutOrStderr(), "WGMGT web UI: %s\n", srv.URL(webFlags.listen))
-		return http.ListenAndServe(webFlags.listen, srv.Handler())
+		host := "127.0.0.1"
+		if webFlags.global {
+			host = "0.0.0.0"
+		}
+		listen := net.JoinHostPort(host, strconv.Itoa(webFlags.port))
+		fmt.Fprintf(cmd.OutOrStderr(), "WGMGT web UI: %s\n", srv.URL(listen))
+		if webFlags.global {
+			fmt.Fprintf(cmd.OutOrStderr(), "WARNING: PLAIN HTTP on all interfaces — the URL token (and every client\nconf it serves, private keys included) is readable on the path. Prefer\nloopback + SSH tunnel, or a TLS reverse proxy.\n")
+		}
+		return http.ListenAndServe(listen, srv.Handler())
 	},
 }
 
 func init() {
-	webCmd.Flags().StringVar(&webFlags.listen, "listen", "127.0.0.1:8080", "listen address (default loopback only)")
+	webCmd.Flags().IntVar(&webFlags.port, "port", 8080, "listen port")
+	webCmd.Flags().BoolVar(&webFlags.global, "global", false, "listen on all interfaces (default loopback only)")
 	rootCmd.AddCommand(webCmd)
 }
