@@ -1,6 +1,6 @@
 # WGMGT
 
-[![Status: M0](https://img.shields.io/badge/status-M0-blue)](docs/PLAN.md)
+[![Status: M1](https://img.shields.io/badge/status-M1-blue)](docs/PLAN.md)
 
 An open-source helper tool for deploying, managing, and visualizing
 [kernel WireGuard](https://www.wireguard.com/) — from standard Linux servers
@@ -24,11 +24,17 @@ go build -o wgmgt ./cmd/wgmgt
 ## Quick start
 
 ```sh
-wgmgt version   # print version
-wgmgt doctor    # check kernel WireGuard compatibility
+sudo wgmgt init                     # wizard: create an interface
+sudo wgmgt peer add --name laptop   # generates keys, prints client conf
+sudo wgmgt up                       # native netlink bring-up
+sudo wgmgt status                   # handshakes and traffic
+
+wgmgt doctor                        # check kernel WireGuard compatibility
 ```
 
 ## Status
 
-M0 (skeleton + kernel compatibility check). See the
-[roadmap](docs/PLAN.md) for what's next.
+M1 — single-host CLI loop complete (interface/peer lifecycle, SQLite
+storage, wg-quick conf generation, native netlink up/down, live status).
+End-to-end handshake verified. See the [roadmap](docs/PLAN.md) for what's
+next (web UI, server+agent, router packages).

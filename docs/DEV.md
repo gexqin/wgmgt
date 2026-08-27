@@ -30,13 +30,49 @@ GOOS=linux GOARCH=arm   go build -o wgmgt-linux-armv7 ./cmd/wgmgt
 wgmgt/
 ├── cmd/wgmgt/          # main 入口,只做 cli.Execute()
 ├── internal/
-│   ├── cli/            # cobra 命令树:root / version / doctor
-│   └── wgkern/         # 内核 WireGuard 检测(纯检测,无副作用管理)
+│   ├── cli/            # cobra 命令树:init/up/down/peer/status/doctor/version
+│   ├── confgen/        # wg-quick 兼容 conf 渲染(服务端 + 客户端)
+│   ├── store/          # SQLite 存储(modernc.org/sqlite,纯 Go 无 CGO)
+│   ├── wgctl/          # netlink 应用层:up/down/热应用/状态读取
+│   └── wgkern/         # 内核 WireGuard 检测
 └── docs/               # 本文档
 ```
 
 分层原则:`cli` 层只做参数解析与输出格式化,业务逻辑放 `internal/*`
 领域包中,保证逻辑可单测(命令处理函数不写测试,领域包写)。
+
+## 关键实现事实
+
+- **SQLite 驱动是 modernc.org/sqlite(纯 Go)**,不是 mattn/go-sqlite3:
+  保持 CGO-free,交叉编译到梅林/OpenWrt(musl/arm)才能零成本。
+  代价是二进制约 13MB。
+- **单连接串行化**:`db.SetMaxOpenConns(1)` 规避 SQLITE_BUSY,
+  modernc 驱动不支持并发写。
+- **up 是原生 netlink**(`vishvananda/netlink` 建链路/地址/路由 +
+  `wgctrl` 下发 WG 配置),不 shell 出 wg-quick——路由器上没有
+  wireguard-tools 也能用。
+- **默认路由跳过**:allowed IP 为 0.0.0.0/0 时只告警不加路由,
+  策略路由(fwmark/Table)是 M1 之后的议题。
+
+## 回归测试:本机端到端
+
+不依赖第二台机器,用 netns + veth 模拟客户端,M1 即用此法验证过
+握手与数据面:
+
+```sh
+T=/tmp/e2e; W=./wgmgt
+$W --db $T/db --conf-dir $T init --name wgS --address 10.99.0.1/24 --port 51899
+$W --db $T/db --conf-dir $T init --name wgC --address 10.99.0.5/24 --port 51900
+# 从 init 输出抓两个公钥,交叉 peer add(--public-key 导入)
+# veth: 192.0.2.1/30 (root ns) ↔ 192.0.2.2/30 (netns wgc)
+sudo $W --db $T/db --conf-dir $T up wgS
+sudo ip netns exec wgc $W --db $T/db --conf-dir $T up wgC
+sudo ip netns exec wgc ping -c3 10.99.0.1     # 期望 0% loss
+sudo $W --db $T/db --conf-dir $T status wgS   # 期望 handshake + rx/tx
+```
+
+netlink 是 per-netns 的,所以 `ip netns exec` 里跑 `up` 会把链路建在
+那个命名空间里——这也顺带验证了 netns 感知正确性。
 
 ## 关键设计决策
 

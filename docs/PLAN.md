@@ -56,7 +56,7 @@
 | 里程碑 | 内容 | 状态 |
 |--------|------|------|
 | **M0 骨架** | git/go.mod、cobra CLI、`version`、`doctor`(内核 WG 检测) | ✅ 完成(commit e26988a) |
-| **M1 单机 CLI 闭环** | `init` 向导/高级模式、接口 up/down、peer 增删查、配置持久化(`/etc/wireguard/wgmgt/`)、`status` 含流量统计 | 下一步 |
+| **M1 单机 CLI 闭环** | `init` 向导/高级模式、接口 up/down、peer 增删查(含 `--public-key` 导入)、配置持久化(SQLite + conf 生成)、`status` 含流量统计;netns+veth 端到端握手已验证 | ✅ 完成 |
 | **M2 单机 Web UI** | go:embed 内嵌 UI、只读可视化(拓扑/流量)+ 操作向导 | 计划 |
 | **M3 主控 + agent** | server 集中管理多节点、agent 上报、配置下发、跨节点 peer 规划(自动分配地址段) | 计划 |
 | **M4 平台适配** | 交叉编译矩阵(amd64/arm64/armv7)、Docker 镜像、OpenWrt ipk、梅林插件包 | 计划 |
