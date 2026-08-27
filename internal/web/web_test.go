@@ -13,6 +13,7 @@ import (
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/gexqin/wgmgt/internal/app"
+	"github.com/gexqin/wgmgt/internal/control"
 	"github.com/gexqin/wgmgt/internal/store"
 )
 
@@ -144,6 +145,38 @@ func TestPeerAddAndRemoveFlow(t *testing.T) {
 	_, body = get(t, ts, prefix+"/iface/wgt0")
 	if strings.Contains(body, "10.99.0.2/32") {
 		t.Error("peer still visible after remove")
+	}
+}
+
+func TestIfaceCreateRejectsPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.EnsureNode("n1", "fp"); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewController(&app.App{Store: st, ConfDir: dir}, control.NewReports())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cts := httptest.NewServer(srv.Handler())
+	defer cts.Close()
+	cprefix := "/t/" + srv.Token()
+
+	for _, evil := range []string{"../../tmp/pwned", "a/b", "way.too.long.interface.name"} {
+		resp, err := noRedirect(t).PostForm(cts.URL+cprefix+"/node/n1/ifaces", url.Values{
+			"name": {evil}, "address": {"10.0.0.1/24"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("name %q = %d, want 400", evil, resp.StatusCode)
+		}
 	}
 }
 

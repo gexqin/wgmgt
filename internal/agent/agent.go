@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,7 +57,7 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeou
 	if err != nil {
 		return nil, fmt.Errorf("agent certificate: %w", err)
 	}
-	return &Agent{
+	a := &Agent{
 		serverURL: strings.TrimSuffix(serverURL, "/"),
 		client: &http.Client{
 			// A hard request timeout matters: a locked-out node's polls hang
@@ -72,7 +73,9 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeou
 		interval:      interval,
 		verifyTimeout: verifyTimeout,
 		confDir:       confDir,
-	}, nil
+	}
+	a.loadQuarantine()
+	return a, nil
 }
 
 // Run polls until the context is cancelled. The first poll happens
@@ -110,7 +113,33 @@ func (a *Agent) checkWatchdog() {
 		a.verifyTimeout, a.appliedVer)
 	a.teardown()
 	a.quarantinedVer = a.appliedVer
+	a.saveQuarantine(a.quarantinedVer)
 	a.verifying = false
+}
+
+// Quarantine survives restarts (a locked-out-then-rebooted node must not
+// reapply the same broken config), so it lives in the conf dir.
+func (a *Agent) quarantinePath() string { return filepath.Join(a.confDir, ".quarantine") }
+
+func (a *Agent) saveQuarantine(version int64) {
+	os.MkdirAll(a.confDir, 0o700)
+	os.WriteFile(a.quarantinePath(), []byte(strconv.FormatInt(version, 10)), 0o600)
+}
+
+func (a *Agent) loadQuarantine() {
+	b, err := os.ReadFile(a.quarantinePath())
+	if err != nil {
+		return
+	}
+	if v, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64); err == nil && v > 0 {
+		a.quarantinedVer = v
+		log.Printf("agent: resuming quarantine at config v%d", v)
+	}
+}
+
+func (a *Agent) clearQuarantine() {
+	a.quarantinedVer = 0
+	os.Remove(a.quarantinePath())
 }
 
 // teardown stops every managed interface (conf files stay as the record
@@ -164,7 +193,7 @@ func (a *Agent) PollOnce(ctx context.Context) error {
 			return fmt.Errorf("apply v%d: %w", cfg.Version, err)
 		} else {
 			a.appliedVer = cfg.Version
-			a.quarantinedVer = 0
+			a.clearQuarantine()
 			if a.verifyTimeout > 0 {
 				// New config pending verification by the NEXT poll.
 				a.verifying = true
@@ -207,6 +236,12 @@ func (a *Agent) Apply(cfg []control.AgentInterface) error {
 		a.sigs = map[string]ifaceSig{}
 	}
 	for _, ci := range cfg {
+		// Defense in depth: the controller validates names too, but the
+		// conf-file writes below turn names into paths, so an agent never
+		// trusts a name it did not verify itself.
+		if !store.ValidIfaceName(ci.Name) {
+			return fmt.Errorf("invalid interface name %q from controller", ci.Name)
+		}
 		ifc := &store.Interface{
 			Name: ci.Name, PrivateKey: ci.PrivateKey, ListenPort: ci.ListenPort,
 			Address: ci.Address, MTU: ci.MTU, PostUp: ci.PostUp, PostDown: ci.PostDown,
@@ -227,8 +262,11 @@ func (a *Agent) Apply(cfg []control.AgentInterface) error {
 			return fmt.Errorf("write %s: %w", path, err)
 		}
 		sig := sigOf(ci)
-		_, known := a.sigs[ci.Name]
-		if !wgctl.Exists(ci.Name) || (known && a.sigs[ci.Name] != sig) {
+		prev, known := a.sigs[ci.Name]
+		// An unknown signature (agent restart with the device up) rebuilds
+		// once — otherwise routing changes would never reach a device that
+		// outlived the agent process.
+		if !wgctl.Exists(ci.Name) || !known || prev != sig {
 			if wgctl.Exists(ci.Name) {
 				if err := wgctl.Down(ifc); err != nil {
 					return fmt.Errorf("rebuild down %s: %w", ci.Name, err)

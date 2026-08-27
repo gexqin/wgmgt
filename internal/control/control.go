@@ -5,9 +5,12 @@
 package control
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -127,16 +130,33 @@ func (a *API) Server(addr string, cert tls.Certificate, caPool *x509.CertPool) *
 	}
 }
 
-// handlePoll authenticates the agent by certificate CN, records its report,
-// and returns the desired config when the agent's version is stale.
+// handlePoll authenticates the agent by certificate CN plus fingerprint,
+// records its report, and returns the desired config when the agent's
+// version is stale. The fingerprint check is the revocation mechanism:
+// re-running `wgmgt server enroll <node>` issues a new certificate and
+// supersedes the old one immediately.
 func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
 		http.Error(w, "client certificate required", http.StatusUnauthorized)
 		return
 	}
-	node := r.TLS.PeerCertificates[0].Subject.CommonName
+	peerCert := r.TLS.PeerCertificates[0]
+	node := peerCert.Subject.CommonName
 	if node == "" || node == "wgmgt-ca" || node == "wgmgt-server" {
 		http.Error(w, "invalid node certificate", http.StatusUnauthorized)
+		return
+	}
+	n, err := a.store.GetNode(node)
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "node not enrolled", http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if fp := certFingerprint(peerCert); n.Fingerprint != "" && n.Fingerprint != fp {
+		http.Error(w, "certificate superseded (re-enroll the node)", http.StatusForbidden)
 		return
 	}
 
@@ -173,6 +193,12 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// certFingerprint mirrors certs.Fingerprint without an import cycle.
+func certFingerprint(cert *x509.Certificate) string {
+	sum := sha256.Sum256(cert.Raw)
+	return fmt.Sprintf("%x", sum)
+}
+
 func (a *API) configFor(node string) ([]AgentInterface, error) {
 	ifaces, err := a.store.ListInterfaces(node)
 	if err != nil {
@@ -184,8 +210,11 @@ func (a *API) configFor(node string) ([]AgentInterface, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Agents never need peers' client private keys — strip them so one
+	// compromised node cannot harvest its peers' client identities.
 	byIface := map[string][]store.Peer{}
 	for _, p := range peers {
+		p.ClientPrivateKey = ""
 		byIface[p.Interface] = append(byIface[p.Interface], p)
 	}
 	out := make([]AgentInterface, 0, len(ifaces))

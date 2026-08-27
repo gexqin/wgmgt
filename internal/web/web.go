@@ -280,7 +280,11 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			s.serverError(w, err)
 			return
 		}
-		ifaces, _ := s.app.Store.ListInterfaces("*")
+		ifaces, err := s.app.Store.ListInterfaces("") // "" = all nodes
+		if err != nil {
+			s.serverError(w, err)
+			return
+		}
 		counts := map[string]int{}
 		for _, ifc := range ifaces {
 			counts[ifc.Node]++
@@ -353,6 +357,12 @@ func (s *Server) handleIfaceCreate(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(r.PostFormValue("name"))
 	if name == "" {
 		s.badRequest(w, "interface name is required")
+		return
+	}
+	// Interface names become conf file names on agents — strict validation
+	// is a path-traversal guard, not cosmetics.
+	if !store.ValidIfaceName(name) {
+		s.badRequest(w, "invalid interface name (max 15 chars, [a-zA-Z0-9_-])")
 		return
 	}
 	address := strings.TrimSpace(r.PostFormValue("address"))

@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"net/netip"
-	"regexp"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -12,8 +11,6 @@ import (
 	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/wgkern"
 )
-
-var nameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
 
 var initFlags struct {
 	name    string
@@ -40,7 +37,7 @@ var initCmd = &cobra.Command{
 		if !cmd.Flags().Changed("name") {
 			name = prompt("Interface name", "wg0")
 		}
-		if !nameRe.MatchString(name) {
+		if !store.ValidIfaceName(name) {
 			return fmt.Errorf("invalid interface name %q (max 15 chars, [a-zA-Z0-9_-])", name)
 		}
 		if _, err := st.GetInterface("", name); err == nil {

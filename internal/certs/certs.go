@@ -78,7 +78,9 @@ func (ca *CA) Save(dir string) error {
 	return os.WriteFile(filepath.Join(dir, "ca.key"), pemKey(ca.Key), 0o600)
 }
 
-// LoadOrNewCA returns the CA in dir, creating it on first run.
+// LoadOrNewCA returns the CA in dir, creating it on first run. A ca.pem
+// without its key is a hard error, not a first run: silently regenerating
+// would invalidate every issued agent certificate (split brain).
 func LoadOrNewCA(dir string) (*CA, error) {
 	ca, err := LoadCA(dir)
 	if err == nil {
@@ -86,6 +88,9 @@ func LoadOrNewCA(dir string) (*CA, error) {
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "ca.pem")); statErr == nil {
+		return nil, fmt.Errorf("ca.pem exists but its key is unreadable (%v) — refusing to regenerate the CA, which would invalidate all agent certificates; restore ca.key or move the whole PKI directory away", err)
 	}
 	ca, err = NewCA()
 	if err != nil {

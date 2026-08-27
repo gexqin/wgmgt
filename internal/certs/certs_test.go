@@ -3,6 +3,7 @@ package certs
 import (
 	"crypto/x509"
 	"encoding/pem"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -73,6 +74,27 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	again, err := LoadOrNewCA(dir)
 	if err != nil || !again.Cert.Equal(ca.Cert) {
 		t.Errorf("LoadOrNewCA regenerated: %v", err)
+	}
+}
+
+func TestLoadOrNewCARefusesToRegenerateWithoutKey(t *testing.T) {
+	dir := t.TempDir()
+	ca, err := NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ca.Save(dir); err != nil {
+		t.Fatal(err)
+	}
+	// ca.key lost: regenerating would invalidate every issued cert — must
+	// be a hard error, not a silent new CA.
+	os.Remove(filepath.Join(dir, "ca.key"))
+	again, err := LoadOrNewCA(dir)
+	if err == nil {
+		t.Fatalf("expected hard error, got CA %v", again.Cert.Subject)
+	}
+	if again != nil {
+		t.Error("no CA should be returned on error")
 	}
 }
 

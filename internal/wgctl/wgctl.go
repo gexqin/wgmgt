@@ -113,7 +113,10 @@ func Down(ifc *store.Interface) error {
 }
 
 // ApplyPeers hot-applies the full peer list to a running device, so peer
-// changes take effect without bouncing the interface.
+// changes take effect without bouncing the interface. Routes for newly
+// added allowed IPs are synced too — without this, traffic to an
+// outside-the-tunnel-subnet allowed IP would silently leave unencrypted
+// via the default route.
 func ApplyPeers(ifc *store.Interface, peers []store.Peer) error {
 	cfg, err := deviceConfig(ifc, peers)
 	if err != nil {
@@ -126,6 +129,14 @@ func ApplyPeers(ifc *store.Interface, peers []store.Peer) error {
 	defer c.Close()
 	if err := c.ConfigureDevice(ifc.Name, *cfg); err != nil {
 		return fmt.Errorf("configure device: %w", err)
+	}
+	if v4, v6 := DefaultRouteFamilies(peers); !v4 && !v6 {
+		// Policy-routing mode carries its own table routes; plain mode
+		// needs the main-table routes refreshed (EEXIST makes it a no-op
+		// for routes already installed).
+		if link, err := netlink.LinkByName(ifc.Name); err == nil {
+			return installRoutes(link, ifc, peers, false, false, 0)
+		}
 	}
 	return nil
 }

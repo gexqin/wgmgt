@@ -20,6 +20,7 @@ type pki struct {
 	server    tls.Certificate
 	pool      *x509.CertPool
 	agentCert tls.Certificate
+	agentFP   string // fingerprint of the agent certificate
 }
 
 func newPKI(t *testing.T, agentName string) pki {
@@ -44,9 +45,13 @@ func newPKI(t *testing.T, agentName string) pki {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fp, err := certs.Fingerprint(agPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
 	pool := x509.NewCertPool()
 	pool.AddCert(ca.Cert)
-	return pki{ca: ca, server: srvTLS, pool: pool, agentCert: agTLS}
+	return pki{ca: ca, server: srvTLS, pool: pool, agentCert: agTLS, agentFP: fp}
 }
 
 func newAPIServer(t *testing.T, st *store.Store, p pki, reports *Reports) *httptest.Server {
@@ -99,17 +104,17 @@ func TestPollPushesConfigAndRecordsReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.EnsureNode("n1", "fp"); err != nil {
-		t.Fatal(err)
-	}
 	if err := st.CreateInterface(&store.Interface{Node: "n1", Name: "wg0", PrivateKey: "k", Address: "10.5.0.1/24", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AddPeer(&store.Peer{Node: "n1", Interface: "wg0", Name: "p1", PublicKey: "pub", AllowedIPs: "10.5.0.2/32"}); err != nil {
+	if err := st.AddPeer(&store.Peer{Node: "n1", Interface: "wg0", Name: "p1", PublicKey: "pub", AllowedIPs: "10.5.0.2/32", ClientPrivateKey: "SECRET-CLIENT-KEY"}); err != nil {
 		t.Fatal(err)
 	}
 
 	p := newPKI(t, "n1")
+	if err := st.EnsureNode("n1", p.agentFP); err != nil {
+		t.Fatal(err)
+	}
 	reports := NewReports()
 	ts := newAPIServer(t, st, p, reports)
 	c := clientFor(t, p)
@@ -119,8 +124,12 @@ func TestPollPushesConfigAndRecordsReport(t *testing.T) {
 		t.Fatalf("poll = %d %+v", code, resp)
 	}
 	ifc := (*resp.Interfaces)[0]
-	if ifc.Name != "wg0" || !ifc.Enabled || len(ifc.Peers) != 1 || ifc.Peers[0].ClientPrivateKey != "" {
-		t.Errorf("interface payload wrong: %+v", ifc)
+	if ifc.Name != "wg0" || !ifc.Enabled || len(ifc.Peers) != 1 {
+		t.Fatalf("interface payload wrong: %+v", ifc)
+	}
+	// The peer's client private key must NEVER travel to the agent.
+	if ifc.Peers[0].ClientPrivateKey != "" {
+		t.Errorf("client private key leaked to agent: %q", ifc.Peers[0].ClientPrivateKey)
 	}
 
 	// Report recorded with live data from the request body.
@@ -164,6 +173,37 @@ func TestPollRejectsServerCN(t *testing.T) {
 	code, _ := poll(t, c, ts.URL, 0)
 	if code != http.StatusUnauthorized {
 		t.Errorf("server-CN cert should be rejected, got %d", code)
+	}
+}
+
+func TestPollEnforcesFingerprint(t *testing.T) {
+	st, _ := store.Open(filepath.Join(t.TempDir(), "db"))
+	defer st.Close()
+
+	p := newPKI(t, "n1")
+	ts := newAPIServer(t, st, p, NewReports())
+	c := clientFor(t, p)
+
+	// Not enrolled at all.
+	if code, _ := poll(t, c, ts.URL, 0); code != http.StatusForbidden {
+		t.Errorf("unenrolled node = %d, want 403", code)
+	}
+
+	// Enrolled with a different (superseded) fingerprint — the revocation
+	// path: re-enroll replaces the fingerprint, old cert stops working.
+	if err := st.EnsureNode("n1", "superseded-fingerprint"); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := poll(t, c, ts.URL, 0); code != http.StatusForbidden {
+		t.Errorf("superseded cert = %d, want 403", code)
+	}
+
+	// Enrolled with the real fingerprint — allowed.
+	if err := st.EnsureNode("n1", p.agentFP); err != nil {
+		t.Fatal(err)
+	}
+	if code, _ := poll(t, c, ts.URL, 0); code != http.StatusOK {
+		t.Errorf("matching cert = %d, want 200", code)
 	}
 }
 

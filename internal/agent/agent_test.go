@@ -54,6 +54,32 @@ func TestWatchdogDisabledOrIdle(t *testing.T) {
 	}
 }
 
+func TestQuarantinePersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	a := &Agent{confDir: dir, verifyTimeout: time.Second, verifying: true, appliedVer: 7}
+	a.pendingSince = time.Now().Add(-2 * time.Second)
+	a.checkWatchdog() // fires: rollback + save
+
+	if a.quarantinedVer != 7 {
+		t.Fatalf("quarantinedVer = %d, want 7", a.quarantinedVer)
+	}
+
+	// A "restarted" agent loads the quarantine state from the conf dir.
+	b := &Agent{confDir: dir}
+	b.loadQuarantine()
+	if b.quarantinedVer != 7 {
+		t.Errorf("quarantine lost on restart: %d", b.quarantinedVer)
+	}
+
+	// Successful apply clears it (file included).
+	b.clearQuarantine()
+	c := &Agent{confDir: dir}
+	c.loadQuarantine()
+	if c.quarantinedVer != 0 {
+		t.Errorf("quarantine not cleared: %d", c.quarantinedVer)
+	}
+}
+
 func TestQuarantineAllowsNewerVersionOnly(t *testing.T) {
 	// Mirrors the gate in PollOnce: quarantined at v7 means only >7 may apply.
 	a := &Agent{quarantinedVer: 7}

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 
 	_ "modernc.org/sqlite" // pure-Go driver, keeps cross-compilation CGO-free
 )
@@ -329,6 +330,24 @@ func (s *Store) ListNodes() ([]Node, error) {
 	}
 	return out, rows.Err()
 }
+
+// GetNode returns a registered node by name.
+func (s *Store) GetNode(name string) (*Node, error) {
+	var n Node
+	err := s.db.QueryRow("SELECT name, fingerprint, last_seen FROM nodes WHERE name = ?", name).
+		Scan(&n.Name, &n.Fingerprint, &n.LastSeen)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: node %q", ErrNotFound, name)
+	}
+	return &n, err
+}
+
+// ValidIfaceName reports whether name is a safe Linux interface name.
+// It doubles as a path-safety guard: interface names become conf file
+// names on agents, so this must stay strict.
+var ifaceNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
+
+func ValidIfaceName(name string) bool { return ifaceNameRe.MatchString(name) }
 
 // --- internals ---
 

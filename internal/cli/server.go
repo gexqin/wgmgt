@@ -83,6 +83,12 @@ var serverCmd = &cobra.Command{
 		fmt.Fprintf(out, "WGMGT controller\n")
 		fmt.Fprintf(out, "  agent API (mTLS): https://%s\n", displayAddr(serverFlags.api))
 		fmt.Fprintf(out, "  web console:      %s\n", webSrv.URL(serverFlags.webAddr))
+		if host, _, err := net.SplitHostPort(serverFlags.webAddr); err == nil && host != "" && host != "localhost" && host != "127.0.0.1" && host != "::1" {
+			fmt.Fprintf(out, "\nWARNING: the web console is PLAIN HTTP on a non-loopback address.\n"+
+				"The URL token (and every client conf it serves, private keys included)\n"+
+				"is readable by anything on the path. Bind a reverse proxy with TLS in\n"+
+				"front, or keep --web on loopback and tunnel in via SSH.\n")
+		}
 
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
