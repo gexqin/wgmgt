@@ -59,7 +59,7 @@
 | **M0 骨架** | git/go.mod、cobra CLI、`version`、`doctor`(内核 WG 检测) | ✅ 完成(commit e26988a) |
 | **M1 单机 CLI 闭环** | `init` 向导/高级模式、接口 up/down、peer 增删查(含 `--public-key` 导入)、配置持久化(SQLite + conf 生成)、`status` 含流量统计;netns+veth 端到端握手已验证 | ✅ 完成 |
 | **M2 单机 Web UI** | go:embed 内嵌 HTMX UI、接口卡片/统计磁贴/peer 表(5s 刷新)、表单加 peer(向导+高级折叠)、Up/Down、客户端 conf 查看;token-in-URL 鉴权,默认仅监听 127.0.0.1 | ✅ 完成 |
-| **M3 主控 + agent** | server 集中管理多节点、agent 上报、配置下发、跨节点 peer 规划(自动分配地址段) | 计划 |
+| **M3 主控 + agent** | 内置 PKI(CA/服务端/agent 证书,`server enroll` 签发)、mTLS poll API(JSON,agent 主动外连)、agent 无状态拉取收敛(conf 生成 + netlink 应用)、状态随轮询上报、控制台 Web(节点总览/建接口/peer 管理/Enable-Disable 期望态);E2E:单机双 agent 跨 netns 经控制台建隧道并握手 | ✅ 完成 |
 | **M4 平台适配** | 交叉编译矩阵(amd64/arm64/armv7)、Docker 镜像、OpenWrt ipk、梅林插件包 | 计划 |
 | **M5 发布打磨** | CI/CD、语义化版本、文档站、发布流程 | 计划 |
 

@@ -1,6 +1,6 @@
 # WGMGT 使用说明
 
-> 当前版本:**M2**——单机 CLI + Web UI(HTMX 内嵌)。
+> 当前版本:**M3**——单机 CLI + Web UI + 主控/agent 多节点集中管理。
 > 完整路线图见 [PLAN.md](PLAN.md)。本文档只描述**已实现**的功能。
 
 ## 安装
@@ -119,11 +119,48 @@ WGMGT web UI: http://127.0.0.1:8080/t/913fc4cf45d2…/
 - 零前端构建链:HTML 模板 + 手写 CSS + 内嵌 htmx(go:embed),
   浅色/深色自适应
 
+### `wgmgt server` / `wgmgt server enroll` / `wgmgt agent`(需 root,M3)
+
+集中管理多节点。协议:JSON + TLS + mTLS,agent 主动外连拉取配置
+(默认 30s,可用 `--interval` 调),状态随轮询上报。
+
+```
+# 1. 控制端(一次)
+sudo wgmgt server                       # 首次启动自动生成 CA 与服务端证书
+                                        # API :8443(mTLS),控制台 127.0.0.1:8080
+
+# 2. 签发 agent 证书(每个节点一次)
+sudo wgmgt server enroll router1 --out .
+#  → router1.pem / router1.key / ca.pem,拷到目标节点
+
+# 3. 目标节点上
+sudo wgmgt agent --server https://控制端:8443 \
+    --ca ca.pem --cert router1.pem --key router1.key
+```
+
+控制台(`wgmgt server` 打印的 token URL):
+
+- **节点总览**:在线状态(上报新鲜度)、接口数、最近上报时间
+- **节点详情 / 建接口**:表单向导(名称/地址/端口/MTU),agent 下一轮
+  拉取即生效(默认 ≤30s)
+- **接口详情**:与单机版一致,但握手/流量来自 agent 实时上报;
+  Up/Down 变为 **Enable/Disable**(改期望态,agent 收敛)
+- **peer 管理**:表单与单机一致(含公钥导入),支持跨节点互配
+
+安全模型与边界:
+
+- agent 证书 CN 即节点名;无证书者连 TLS 握手都过不了
+- 控制端持有所有节点的接口私钥(集中式配置管理的固有代价)
+- agent 无本地状态(除证书与生成的 conf),重启即重新收敛
+- 接口地址变更在设备运行中不自动生效(只热更新 peer),需 disable→enable
+
 ## 验证过的端到端测试
 
 开发中用 netns + veth 对在本机模拟了完整的客户端-服务器握手与数据面
-(见 [DEV.md](DEV.md) 的回归测试一节)。
+(见 [DEV.md](DEV.md) 的回归测试一节)。M3 另验证了:单机双 agent
+(一个在根命名空间、一个在独立 netns)经同一控制台建隧道、跨节点
+握手、远程 enable/disable 收敛。
 
 ## 后续版本预告(未实现)
 
-- `wgmgt server / wgmgt agent` — 多节点集中管理(M3)
+- Docker 镜像、OpenWrt ipk、梅林插件、交叉编译矩阵(M4)

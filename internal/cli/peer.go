@@ -45,7 +45,7 @@ var peerAddCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		ifc, err := st.GetInterface(name)
+		ifc, err := st.GetInterface("", name)
 		if err != nil {
 			return err
 		}
@@ -102,7 +102,7 @@ var peerAddCmd = &cobra.Command{
 			p.PresharedKey = psk.String()
 		}
 		if peerAddFlags.serverEndpoint != "" {
-			if err := st.UpdateServerEndpoint(name, peerAddFlags.serverEndpoint); err != nil {
+			if err := st.UpdateServerEndpoint("", name, peerAddFlags.serverEndpoint); err != nil {
 				return err
 			}
 			ifc.ServerEndpoint = peerAddFlags.serverEndpoint
@@ -155,7 +155,7 @@ var peerListCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		peers, err := st.ListPeers(name)
+		peers, err := st.ListPeers("", name)
 		if err != nil {
 			return err
 		}
@@ -195,7 +195,7 @@ var peerRmCmd = &cobra.Command{
 			return err
 		}
 		defer st.Close()
-		p, err := st.DeletePeer(args[0], args[1])
+		p, err := st.DeletePeer("", args[0], args[1])
 		if err != nil {
 			return err
 		}
@@ -217,11 +217,11 @@ var peerConfCmd = &cobra.Command{
 			return err
 		}
 		defer st.Close()
-		ifc, err := st.GetInterface(args[0])
+		ifc, err := st.GetInterface("", args[0])
 		if err != nil {
 			return err
 		}
-		p, err := st.GetPeer(args[0], args[1])
+		p, err := st.GetPeer("", args[0], args[1])
 		if err != nil {
 			return err
 		}
@@ -257,4 +257,3 @@ func shortKey(pub string) string {
 	}
 	return pub[:8] + "…" + pub[len(pub)-3:]
 }
-

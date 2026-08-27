@@ -120,6 +120,7 @@ h2 { font-size: 17px; margin: 28px 0 10px; }
 
 .tile-num { font-size: 17px; font-weight: 650; font-variant-numeric: tabular-nums; }
 .tile-label { font-size: 12px; color: var(--muted); }
+.tile-key { font-size: 11px; font-weight: 500; word-break: break-all; font-family: ui-monospace, Menlo, monospace; }
 
 table {
   width: 100%;

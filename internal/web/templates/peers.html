@@ -17,8 +17,8 @@
       <td class="num">{{if .Live}}{{.Rx}}{{else}}–{{end}}</td>
       <td class="num">{{if .Live}}{{.Tx}}{{else}}–{{end}}</td>
       <td class="row-actions">
-        <a class="btn small" href="{{u "iface" $.Iface.Name "peers" .Peer.Name "conf"}}">conf</a>
-        <form method="post" action="{{u "iface" $.Iface.Name "peers" .Peer.Name "rm"}}">
+        <a class="btn small" href="{{iu $.Iface "peers" .Peer.Name "conf"}}">conf</a>
+        <form method="post" action="{{iu $.Iface "peers" .Peer.Name "rm"}}">
           <button class="btn small danger">rm</button>
         </form>
       </td>

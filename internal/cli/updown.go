@@ -24,11 +24,11 @@ var upCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		ifc, err := st.GetInterface(name)
+		ifc, err := st.GetInterface("", name)
 		if err != nil {
 			return err
 		}
-		peers, err := st.ListPeers(name)
+		peers, err := st.ListPeers("", name)
 		if err != nil {
 			return err
 		}
@@ -56,7 +56,7 @@ var downCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		ifc, err := st.GetInterface(name)
+		ifc, err := st.GetInterface("", name)
 		if err != nil {
 			return err
 		}

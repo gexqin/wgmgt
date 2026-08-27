@@ -30,12 +30,15 @@ GOOS=linux GOARCH=arm   go build -o wgmgt-linux-armv7 ./cmd/wgmgt
 wgmgt/
 ├── cmd/wgmgt/          # main 入口,只做 cli.Execute()
 ├── internal/
+│   ├── agent/          # agent:pull 循环、配置收敛(netlink)、状态上报
 │   ├── app/            # CLI 与 Web 共享的编排:SyncConf、NextFreeIP
-│   ├── cli/            # cobra 命令树:init/up/down/peer/status/web/doctor/version
+│   ├── certs/          # 内置 PKI:CA / 服务端证书 / agent 客户端证书
+│   ├── cli/            # cobra 命令树:init/up/down/peer/status/web/server/agent/doctor/version
 │   ├── confgen/        # wg-quick 兼容 conf 渲染(服务端 + 客户端)
+│   ├── control/        # 控制端:mTLS poll API、配置下发、状态上报缓存
 │   ├── humanize/       # 时长/字节的人类可读格式化
-│   ├── store/          # SQLite 存储(modernc.org/sqlite,纯 Go 无 CGO)
-│   ├── web/            # 内嵌 Web UI(go:embed 模板+静态资源,token 鉴权)
+│   ├── store/          # SQLite 存储(多节点:interfaces 按 (node,name) 主键)
+│   ├── web/            # 内嵌 Web UI(go:embed;本地/控制台双模式)
 │   ├── wgctl/          # netlink 应用层:up/down/热应用/状态读取
 │   └── wgkern/         # 内核 WireGuard 检测
 └── docs/               # 本文档
@@ -43,6 +46,31 @@ wgmgt/
 
 分层原则:`cli`/`web` 层只做参数/请求解析与呈现,业务逻辑放
 `internal/*` 领域包中,保证可单测(命令处理函数不写测试,领域包写)。
+
+## 控制端 / agent 要点(M3)
+
+- **协议**:POST /api/poll,JSON over mTLS。agent 的证书 CN 即节点名;
+  请求体带 `since`(已应用的配置版本)+ 实时状态;版本落后时响应
+  携带完整期望配置,否则只回版本号(几百字节)。
+- **配置版本**:`interfaces.config_version` 每次变更 +1,节点版本取其
+  接口的最大值。agent 只在版本变化时重新应用(避免每 30s 重置 peer
+  流量计数器)。
+- **agent 无状态**:唯一本地痕迹是 conf 目录(也作为"受管接口集合"
+  的记录,重启后据此上报状态)。
+- **期望态模型**:控制台的 Enable/Disable 写 `enabled` 列并 bump 版本,
+  agent 收敛(enabled→确保 up;disabled→删设备)。
+- **已知边界**:接口运行中地址/端口变更不自动重建(只热更 peer);
+  需要 disable→enable。控制端持有所有节点私钥(集中管理的固有代价)。
+
+## M3 端到端回归(单机)
+
+```
+server enroll n1/n2 → server 起 --api 192.0.2.1:8443
+agent n1(根 ns) + agent n2(netns wgc,经 veth)
+控制台表单:n1 建 wgA(10.97.0.1/24)、n2 建 wgB(10.97.0.5/24)
+交叉 peer(public-key 导入)→ netns 内 ping 10.97.0.1 全通
+Disable wgB → 设备 4s 内消失;Enable → 重建并恢复握手
+```
 
 ## Web UI 要点
 

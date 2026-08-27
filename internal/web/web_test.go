@@ -107,11 +107,11 @@ func TestPeerAddAndRemoveFlow(t *testing.T) {
 
 	// Add a peer via the form (auto allowed IP expected: 10.99.0.2/32).
 	resp, err := client.PostForm(ts.URL+prefix+"/iface/wgt0/peers", url.Values{
-		"name":             {"laptop"},
-		"server_endpoint":  {"vpn.example.com:51899"},
-		"allowed_ips":      {""},
-		"keepalive":        {"25"},
-		"preshared_key":    {"1"},
+		"name":            {"laptop"},
+		"server_endpoint": {"vpn.example.com:51899"},
+		"allowed_ips":     {""},
+		"keepalive":       {"25"},
+		"preshared_key":   {"1"},
 	})
 	if err != nil {
 		t.Fatal(err)

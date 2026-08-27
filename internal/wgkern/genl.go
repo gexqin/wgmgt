@@ -30,7 +30,7 @@ func genlFamilyGet(fd int, name string) error {
 	buf[unix.NLMSG_HDRLEN] = ctrlCmdGetFamily
 	buf[unix.NLMSG_HDRLEN+1] = 1 // version
 
-	off := unix.NLMSG_HDRLEN + 4 // genlmsghdr size
+	off := unix.NLMSG_HDRLEN + 4                                   // genlmsghdr size
 	binary.NativeEndian.PutUint16(buf[off:off+2], uint16(attrLen)) // nla_len
 	binary.NativeEndian.PutUint16(buf[off+2:off+4], ctrlAttrFamilyName)
 	copy(buf[off+4:], name)

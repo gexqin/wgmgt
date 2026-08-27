@@ -43,7 +43,7 @@ var initCmd = &cobra.Command{
 		if !nameRe.MatchString(name) {
 			return fmt.Errorf("invalid interface name %q (max 15 chars, [a-zA-Z0-9_-])", name)
 		}
-		if _, err := st.GetInterface(name); err == nil {
+		if _, err := st.GetInterface("", name); err == nil {
 			return fmt.Errorf("interface %q already exists", name)
 		}
 
@@ -70,12 +70,13 @@ var initCmd = &cobra.Command{
 		}
 
 		ifc := &store.Interface{
-			Name:        name,
-			PrivateKey:  key.String(),
-			ListenPort:  port,
-			Address:     prefix.String(),
-			MTU:         initFlags.mtu,
-			DNS:         initFlags.dns,
+			Enabled:    true,
+			Name:       name,
+			PrivateKey: key.String(),
+			ListenPort: port,
+			Address:    prefix.String(),
+			MTU:        initFlags.mtu,
+			DNS:        initFlags.dns,
 		}
 		if err := st.CreateInterface(ifc); err != nil {
 			return fmt.Errorf("store interface: %w", err)

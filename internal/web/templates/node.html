@@ -1,0 +1,33 @@
+{{define "content"}}
+<h1>Node <span class="muted">{{.Node}}</span></h1>
+{{if not .Interfaces}}
+<p class="empty">No interfaces on this node yet — create one below.</p>
+{{else}}
+<div class="cards">
+{{range .Interfaces}}
+  <div class="card">
+    <div class="card-head">
+      <a class="card-title" href="{{iu .}}">{{.Name}}</a>
+      <span class="state {{if .ReportedUp}}up{{else}}down{{end}}">{{if .ReportedUp}}● UP{{else}}{{if .Enabled}}○ PENDING{{else}}○ DISABLED{{end}}{{end}}</span>
+    </div>
+    <dl class="card-meta">
+      <div><dt>address</dt><dd><code>{{.Address}}</code></dd></div>
+      <div><dt>port</dt><dd>{{.ListenPort}}</dd></div>
+      <div><dt>peers</dt><dd>{{.PeerCount}}</dd></div>
+    </dl>
+  </div>
+{{end}}
+</div>
+{{end}}
+
+<section>
+<h2>Add interface</h2>
+<form class="grid-form" method="post" action="{{u "node" .Node "ifaces"}}">
+  <label>Name <input name="name" required placeholder="wg0"></label>
+  <label>Tunnel address <input name="address" required placeholder="10.0.0.1/24"></label>
+  <label>Listen port <input name="port" type="number" placeholder="51820"></label>
+  <label>MTU <input name="mtu" type="number" placeholder="auto"></label>
+  <div><button class="btn primary" type="submit">Create interface</button></div>
+</form>
+</section>
+{{end}}

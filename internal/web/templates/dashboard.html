@@ -1,4 +1,26 @@
 {{define "content"}}
+{{if .Controller}}
+<h1>Nodes</h1>
+{{if not .Nodes}}
+<p class="empty">No agents enrolled yet. Run <code>sudo wgmgt server enroll &lt;name&gt;</code>
+on the controller, then start <code>wgmgt agent</code> on the node with the issued files.</p>
+{{else}}
+<div class="cards">
+{{range .Nodes}}
+  <div class="card">
+    <div class="card-head">
+      <a class="card-title" href="{{u "node" .Name}}">{{.Name}}</a>
+      <span class="state {{if .Online}}up{{else}}down{{end}}">{{if .Online}}● ONLINE{{else}}○ OFFLINE{{end}}</span>
+    </div>
+    <dl class="card-meta">
+      <div><dt>interfaces</dt><dd>{{.Interfaces}}</dd></div>
+      <div><dt>last seen</dt><dd>{{if .LastSeen}}{{.LastSeen}} ago{{else}}never{{end}}</dd></div>
+    </dl>
+  </div>
+{{end}}
+</div>
+{{end}}
+{{else}}
 <h1>Interfaces</h1>
 {{if not .Cards}}
 <p class="empty">No interfaces yet. Create one with <code>sudo wgmgt init</code>.</p>
@@ -18,5 +40,6 @@
   </div>
 {{end}}
 </div>
+{{end}}
 {{end}}
 {{end}}

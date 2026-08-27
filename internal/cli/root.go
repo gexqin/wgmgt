@@ -63,12 +63,12 @@ func confPath(name string) string { return filepath.Join(confDir, name+".conf") 
 // otherwise the only managed interface (an error if there are none or several).
 func resolveIface(st *store.Store, arg string) (string, error) {
 	if arg != "" {
-		if _, err := st.GetInterface(arg); err != nil {
+		if _, err := st.GetInterface("", arg); err != nil {
 			return "", err
 		}
 		return arg, nil
 	}
-	list, err := st.ListInterfaces()
+	list, err := st.ListInterfaces("")
 	if err != nil {
 		return "", err
 	}

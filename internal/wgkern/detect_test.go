@@ -15,9 +15,9 @@ func write(t *testing.T, path, content string) {
 
 func TestParseKernelVersion(t *testing.T) {
 	cases := []struct {
-		release             string
-		major, minor        int
-		ok                  bool
+		release      string
+		major, minor int
+		ok           bool
 	}{
 		{"6.6.87.2-microsoft-standard-WSL2", 6, 6, true},
 		{"5.15.0-91-generic", 5, 15, true},

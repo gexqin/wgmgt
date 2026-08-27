@@ -1,6 +1,6 @@
 # WGMGT
 
-[![Status: M2](https://img.shields.io/badge/status-M2-blue)](docs/PLAN.md)
+[![Status: M3](https://img.shields.io/badge/status-M3-blue)](docs/PLAN.md)
 [![License: PolyForm NC](https://img.shields.io/badge/license-PolyForm--NC--1.0.0-orange)](LICENSE)
 
 An open-source helper tool for deploying, managing, and visualizing
@@ -31,18 +31,23 @@ sudo wgmgt up                       # native netlink bring-up
 sudo wgmgt status                   # handshakes and traffic
 
 sudo wgmgt web                        # embedded web UI (token-protected)
+sudo wgmgt server                     # controller: mTLS agent API + web console
+sudo wgmgt server enroll router1      # issue an agent certificate
+sudo wgmgt agent --server https://ctrl:8443 --ca ca.pem \
+    --cert router1.pem --key router1.key   # on each managed node
 
 wgmgt doctor                        # check kernel WireGuard compatibility
 ```
 
 ## Status
 
-M2 — single-host CLI loop and embedded web UI complete. The web UI
-(HTMX, zero frontend build chain) shows interfaces, live handshakes and
-traffic, and manages peers with wizard-style forms; it is protected by a
-per-run random token embedded in the URL and listens on loopback by
-default. See the [roadmap](docs/PLAN.md) for what's next (server+agent,
-router packages).
+M3 — single-host CLI loop, embedded web UI, and controller/agent
+multi-node management complete. Agents connect out over mTLS, pull their
+configuration on an interval, apply it via netlink, and report live
+status; the controller web console manages nodes, interfaces, and peers
+across the fleet. Verified end-to-end with two agents in separate
+network namespaces building a tunnel entirely through the console. See
+the [roadmap](docs/PLAN.md) for what's next (router packages, releases).
 
 ## License
 
