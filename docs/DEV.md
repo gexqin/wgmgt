@@ -59,17 +59,42 @@ wgmgt/
   的记录,重启后据此上报状态)。
 - **期望态模型**:控制台的 Enable/Disable 写 `enabled` 列并 bump 版本,
   agent 收敛(enabled→确保 up;disabled→删设备)。
-- **已知边界**:接口运行中地址/端口变更不自动重建(只热更 peer);
-  需要 disable→enable。控制端持有所有节点私钥(集中管理的固有代价)。
+- **热更 vs 重建**:agent 按"路由签名"(地址/端口/MTU/是否含默认路由)
+  决定——签名不变只热更 peer(不断线);变了就重建设备。这也是全隧道
+  开关能生效的机制。
 
-## M3 端到端回归(单机)
+## 全隧道与自锁回退(2026-08-27 补)
 
+- **策略路由**(wgctl):AllowedIPs 含 0/0 或 ::/0 时,wg-quick 同款
+  三件套——设备 fwmark(=表号)、默认路由进 table 51820、两条 rule
+  (`not fwmark → 51820` @32765,`main suppress_prefixlength 0` @32764)。
+  Down 时必须显式删 rule(路由随设备消失,rules 不会)。
+- **验证式看门狗**(agent):应用新配置 → 下一轮成功 poll 即验证;
+  `--verify-timeout`(默认 180s)内未验证 → teardown 全部受管接口 +
+  隔离(该版本不再重试,直到更新的版本)。已验证配置不受控制端
+  后续故障影响(不会误伤)。
+- **两个用血泪换来的实现细节**:
+  1. agent 的 HTTP client 必须有硬超时——黑洞里的 TCP connect 会挂死
+     在 SYN 重传上,卡住整个 Run 循环,看门狗就永远不会被调度;
+  2. 热更 peer 不会重装路由——0/0 加入时若只 ApplyPeers,策略路由
+     根本不生效(不会锁,但也"不会生效")。签名比对才是正解。
+
+## 端到端回归(单机)
+
+M3 基础:
 ```
 server enroll n1/n2 → server 起 --api 192.0.2.1:8443
 agent n1(根 ns) + agent n2(netns wgc,经 veth)
-控制台表单:n1 建 wgA(10.97.0.1/24)、n2 建 wgB(10.97.0.5/24)
-交叉 peer(public-key 导入)→ netns 内 ping 10.97.0.1 全通
-Disable wgB → 设备 4s 内消失;Enable → 重建并恢复握手
+控制台表单:n1 建 wgA、n2 建 wgB → 交叉 peer → ping 通;远程启停收敛
+```
+
+全隧道自锁回退(三 netns:ctrl / node,node 仅默认路由可达 ctrl 的
+网段外地址 10.9.9.9):
+```
+node 起 agent(--verify-timeout 12s)→ 正常接口 v1 ✓
+投毒:0/0 假 peer → v2 → 自锁(rules/table 装上,poll no route to host)
+12s 后回退(rules 清、设备删、连通恢复)+ ⚠ QUARANTINED 徽章
+删毒 peer → v3 → 自动重应用 → ● ONLINE
 ```
 
 ## Web UI 要点

@@ -45,7 +45,10 @@ type AgentInterface struct {
 
 // StatusReport is the agent's live view of its managed devices.
 type StatusReport struct {
-	Interfaces []IfaceReport `json:"interfaces"`
+	// Quarantined means the agent rolled its config back after losing
+	// contact with the controller and is waiting for a newer version.
+	Quarantined bool          `json:"quarantined"`
+	Interfaces  []IfaceReport `json:"interfaces"`
 }
 
 // IfaceReport is one interface's live state.

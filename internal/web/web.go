@@ -206,10 +206,11 @@ type cardView struct {
 }
 
 type nodeCard struct {
-	Name       string
-	LastSeen   string // humanized, "" if never
-	Online     bool
-	Interfaces int
+	Name        string
+	LastSeen    string // humanized, "" if never
+	Online      bool
+	Quarantined bool
+	Interfaces  int
 }
 
 // liveStatus resolves the live state of an interface in either mode.
@@ -291,6 +292,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 				age := time.Since(entry.When)
 				c.LastSeen = humanize.Duration(age)
 				c.Online = age < 2*time.Minute
+				c.Quarantined = entry.Report.Quarantined
 			}
 			cards = append(cards, c)
 		}

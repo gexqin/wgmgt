@@ -31,11 +31,23 @@ type Agent struct {
 	interval   time.Duration
 	confDir    string
 	appliedVer int64
+
+	// Dead-man switch: after applying a config, the agent must reach the
+	// controller again within verifyTimeout. If it cannot (a full-tunnel
+	// route locked the node out, say), it tears its WireGuard down and
+	// refuses to re-apply that config version (quarantine) — the operator
+	// fixes the config, the version bumps, and the agent tries again.
+	verifyTimeout  time.Duration
+	verifying      bool
+	pendingSince   time.Time
+	quarantinedVer int64
+	sigs           map[string]ifaceSig // routing signatures of applied interfaces
 }
 
 // New builds an agent. caPEM/certPEM/keyPEM are the mTLS material issued
-// by `wgmgt server enroll`.
-func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval time.Duration, confDir string) (*Agent, error) {
+// by `wgmgt server enroll`. verifyTimeout enables the dead-man switch
+// (0 disables it).
+func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeout time.Duration, confDir string) (*Agent, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(caPEM) {
 		return nil, fmt.Errorf("invalid CA PEM")
@@ -47,22 +59,31 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval time.Duration
 	return &Agent{
 		serverURL: strings.TrimSuffix(serverURL, "/"),
 		client: &http.Client{
+			// A hard request timeout matters: a locked-out node's polls hang
+			// on TCP connects that never complete, and the watchdog must
+			// still get scheduled — the Run loop only ticks between polls.
+			Timeout: 10 * time.Second,
 			Transport: &http.Transport{TLSClientConfig: &tls.Config{
 				Certificates: []tls.Certificate{cert},
 				RootCAs:      pool,
 				MinVersion:   tls.VersionTLS12,
 			}},
 		},
-		interval: interval,
-		confDir:  confDir,
+		interval:      interval,
+		verifyTimeout: verifyTimeout,
+		confDir:       confDir,
 	}, nil
 }
 
 // Run polls until the context is cancelled. The first poll happens
-// immediately (appliedVer 0 forces a full config fetch).
+// immediately (appliedVer 0 forces a full config fetch). The watchdog runs
+// on a short side ticker so a locked-out node still fires on time even
+// with a long poll interval.
 func (a *Agent) Run(ctx context.Context) error {
-	t := time.NewTicker(a.interval)
-	defer t.Stop()
+	poll := time.NewTicker(a.interval)
+	defer poll.Stop()
+	watch := time.NewTicker(5 * time.Second)
+	defer watch.Stop()
 	for {
 		if err := a.PollOnce(ctx); err != nil {
 			log.Printf("agent: %v", err)
@@ -70,12 +91,49 @@ func (a *Agent) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-t.C:
+		case <-watch.C:
+			a.checkWatchdog()
+		case <-poll.C:
+		}
+	}
+}
+
+// checkWatchdog rolls back an unverified config.
+func (a *Agent) checkWatchdog() {
+	if a.verifyTimeout <= 0 || !a.verifying {
+		return
+	}
+	if time.Since(a.pendingSince) <= a.verifyTimeout {
+		return
+	}
+	log.Printf("agent: controller unreachable for %s after applying config v%d — rolling back WireGuard (quarantined until a newer version)",
+		a.verifyTimeout, a.appliedVer)
+	a.teardown()
+	a.quarantinedVer = a.appliedVer
+	a.verifying = false
+}
+
+// teardown stops every managed interface (conf files stay as the record
+// of the managed set; devices come back when a good config arrives).
+func (a *Agent) teardown() {
+	entries, err := os.ReadDir(a.confDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := strings.TrimSuffix(e.Name(), ".conf")
+		if name == e.Name() {
+			continue
+		}
+		if err := wgctl.Down(&store.Interface{Name: name}); err != nil {
+			log.Printf("agent: rollback %s: %v", name, err)
 		}
 	}
 }
 
 // PollOnce fetches new config (if any), applies it, and reports status.
+// A successful poll also confirms the previously applied config (contact
+// with the controller proves the node is not locked out).
 func (a *Agent) PollOnce(ctx context.Context) error {
 	body, _ := json.Marshal(control.PollRequest{Since: a.appliedVer, Status: a.collectStatus()})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.serverURL+"/api/poll", bytes.NewReader(body))
@@ -99,22 +157,54 @@ func (a *Agent) PollOnce(ctx context.Context) error {
 		return err
 	}
 	if cfg.Interfaces != nil && *cfg.Interfaces != nil {
-		if err := a.Apply(*cfg.Interfaces); err != nil {
+		if a.quarantinedVer > 0 && cfg.Version <= a.quarantinedVer {
+			// The config that locked us out is still current; stay down.
+			a.appliedVer = cfg.Version
+		} else if err := a.Apply(*cfg.Interfaces); err != nil {
 			return fmt.Errorf("apply v%d: %w", cfg.Version, err)
+		} else {
+			a.appliedVer = cfg.Version
+			a.quarantinedVer = 0
+			if a.verifyTimeout > 0 {
+				// New config pending verification by the NEXT poll.
+				a.verifying = true
+				a.pendingSince = time.Now()
+			}
+			log.Printf("agent: applied config v%d (%d interfaces)", cfg.Version, len(*cfg.Interfaces))
 		}
-		a.appliedVer = cfg.Version
-		log.Printf("agent: applied config v%d (%d interfaces)", cfg.Version, len(*cfg.Interfaces))
 	} else {
 		a.appliedVer = cfg.Version
+		// Reaching the controller proves the applied config is safe.
+		a.verifying = false
 	}
 	return nil
 }
 
+// ifaceSig captures everything about an interface that cannot be changed
+// by a hot peer update: address, port, MTU, and whether policy routing
+// (a default route) is engaged. A signature change requires a rebuild.
+type ifaceSig struct {
+	addr   string
+	port   int
+	mtu    int
+	policy bool
+}
+
+func sigOf(ci control.AgentInterface) ifaceSig {
+	v4, v6 := wgctl.DefaultRouteFamilies(ci.Peers)
+	return ifaceSig{addr: ci.Address, port: ci.ListenPort, mtu: ci.MTU, policy: v4 || v6}
+}
+
 // Apply converges the node to the desired state: enabled interfaces up
 // with the right peers, disabled interfaces down, conf files written.
+// Peer-only changes hot-apply; routing-signature changes (address, port,
+// MTU, default-route on/off) rebuild the device.
 func (a *Agent) Apply(cfg []control.AgentInterface) error {
 	if err := os.MkdirAll(a.confDir, 0o700); err != nil {
 		return err
+	}
+	if a.sigs == nil {
+		a.sigs = map[string]ifaceSig{}
 	}
 	for _, ci := range cfg {
 		ifc := &store.Interface{
@@ -122,25 +212,34 @@ func (a *Agent) Apply(cfg []control.AgentInterface) error {
 			Address: ci.Address, MTU: ci.MTU, PostUp: ci.PostUp, PostDown: ci.PostDown,
 		}
 		path := filepath.Join(a.confDir, ci.Name+".conf")
-		if ci.Enabled {
-			// Conf first (also marks the interface as managed), then netlink.
-			if err := os.WriteFile(path, []byte(confgen.Interface(ifc, ci.Peers)), 0o600); err != nil {
-				return fmt.Errorf("write %s: %w", path, err)
-			}
-			if !wgctl.Exists(ci.Name) {
-				if err := wgctl.Up(ifc, ci.Peers); err != nil {
-					return fmt.Errorf("up %s: %w", ci.Name, err)
-				}
-			} else if err := wgctl.ApplyPeers(ifc, ci.Peers); err != nil {
-				return fmt.Errorf("apply peers %s: %w", ci.Name, err)
-			}
-		} else {
+		if !ci.Enabled {
 			os.Remove(path)
+			delete(a.sigs, ci.Name)
 			if wgctl.Exists(ci.Name) {
 				if err := wgctl.Down(ifc); err != nil {
 					return fmt.Errorf("down %s: %w", ci.Name, err)
 				}
 			}
+			continue
+		}
+		// Conf first (also marks the interface as managed), then netlink.
+		if err := os.WriteFile(path, []byte(confgen.Interface(ifc, ci.Peers)), 0o600); err != nil {
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+		sig := sigOf(ci)
+		_, known := a.sigs[ci.Name]
+		if !wgctl.Exists(ci.Name) || (known && a.sigs[ci.Name] != sig) {
+			if wgctl.Exists(ci.Name) {
+				if err := wgctl.Down(ifc); err != nil {
+					return fmt.Errorf("rebuild down %s: %w", ci.Name, err)
+				}
+			}
+			if err := wgctl.Up(ifc, ci.Peers); err != nil {
+				return fmt.Errorf("up %s: %w", ci.Name, err)
+			}
+			a.sigs[ci.Name] = sig
+		} else if err := wgctl.ApplyPeers(ifc, ci.Peers); err != nil {
+			return fmt.Errorf("apply peers %s: %w", ci.Name, err)
 		}
 	}
 	return nil
@@ -149,7 +248,7 @@ func (a *Agent) Apply(cfg []control.AgentInterface) error {
 // collectStatus reports every managed interface (the conf files mark the
 // managed set, surviving agent restarts) with live peer counters.
 func (a *Agent) collectStatus() control.StatusReport {
-	rep := control.StatusReport{Interfaces: []control.IfaceReport{}}
+	rep := control.StatusReport{Quarantined: a.quarantinedVer > 0, Interfaces: []control.IfaceReport{}}
 	entries, err := os.ReadDir(a.confDir)
 	if err != nil {
 		return rep

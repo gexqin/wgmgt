@@ -10,12 +10,14 @@ on the controller, then start <code>wgmgt agent</code> on the node with the issu
   <div class="card">
     <div class="card-head">
       <a class="card-title" href="{{u "node" .Name}}">{{.Name}}</a>
-      <span class="state {{if .Online}}up{{else}}down{{end}}">{{if .Online}}● ONLINE{{else}}○ OFFLINE{{end}}</span>
+      {{if .Quarantined}}<span class="state down">⚠ QUARANTINED</span>
+      {{else}}<span class="state {{if .Online}}up{{else}}down{{end}}">{{if .Online}}● ONLINE{{else}}○ OFFLINE{{end}}</span>{{end}}
     </div>
     <dl class="card-meta">
       <div><dt>interfaces</dt><dd>{{.Interfaces}}</dd></div>
       <div><dt>last seen</dt><dd>{{if .LastSeen}}{{.LastSeen}} ago{{else}}never{{end}}</dd></div>
     </dl>
+    {{if .Quarantined}}<p class="empty">Rolled back after losing the controller — waiting for a newer config version.</p>{{end}}
   </div>
 {{end}}
 </div>

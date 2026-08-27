@@ -14,12 +14,13 @@ import (
 )
 
 var agentFlags struct {
-	server   string
-	ca       string
-	cert     string
-	key      string
-	interval time.Duration
-	confDir  string
+	server        string
+	ca            string
+	cert          string
+	key           string
+	interval      time.Duration
+	verifyTimeout time.Duration
+	confDir       string
 }
 
 var agentCmd = &cobra.Command{
@@ -45,13 +46,14 @@ var agentCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("--key: %w", err)
 		}
-		a, err := agent.New(agentFlags.server, caPEM, certPEM, keyPEM, agentFlags.interval, agentFlags.confDir)
+		a, err := agent.New(agentFlags.server, caPEM, certPEM, keyPEM, agentFlags.interval, agentFlags.verifyTimeout, agentFlags.confDir)
 		if err != nil {
 			return err
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
-		fmt.Fprintf(cmd.OutOrStderr(), "wgmgt agent: polling %s every %s\n", agentFlags.server, agentFlags.interval)
+		fmt.Fprintf(cmd.OutOrStderr(), "wgmgt agent: polling %s every %s (verify-timeout %s)\n",
+			agentFlags.server, agentFlags.interval, agentFlags.verifyTimeout)
 		return a.Run(ctx)
 	},
 }
@@ -62,6 +64,8 @@ func init() {
 	agentCmd.Flags().StringVar(&agentFlags.cert, "cert", "", "agent certificate (required)")
 	agentCmd.Flags().StringVar(&agentFlags.key, "key", "", "agent private key (required)")
 	agentCmd.Flags().DurationVar(&agentFlags.interval, "interval", 30*time.Second, "poll interval")
+	agentCmd.Flags().DurationVar(&agentFlags.verifyTimeout, "verify-timeout", 180*time.Second,
+		"dead-man switch: if the controller stays unreachable this long after a config change, roll back WireGuard (0 disables)")
 	agentCmd.Flags().StringVar(&agentFlags.confDir, "conf-dir", "/etc/wireguard/wgmgt-agent", "directory for generated conf files")
 	_ = agentCmd.MarkFlagRequired("server")
 	_ = agentCmd.MarkFlagRequired("cert")

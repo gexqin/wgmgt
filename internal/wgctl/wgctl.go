@@ -10,20 +10,36 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/wgctrl"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/gexqin/wgmgt/internal/store"
 )
 
+// defaultPolicyTable is the routing table used for full-tunnel policy
+// routing (same value wg-quick picks). The table number doubles as the
+// firewall mark on the WireGuard UDP socket so tunnel transport escapes
+// into the main table.
+const defaultPolicyTable = 51820
+
+const (
+	rulePrioTunnel   = 32765 // not fwmark <table> → table <table>
+	rulePrioMainSupp = 32764 // table main, suppress_prefixlength 0
+)
+
 // Up brings an interface up natively: create link if needed, assign the
 // tunnel address, configure the device and peers, then set the link up and
 // install routes for peer allowed IPs not covered by the tunnel subnet.
+// Default routes (0.0.0.0/0, ::/0) engage wg-quick-style policy routing:
+// fwmark on the socket, default route in a separate table, and rules that
+// keep marked traffic (the tunnel itself) on the main table.
 // PostUp, when set, runs after everything succeeded.
 func Up(ifc *store.Interface, peers []store.Peer) error {
 	link, err := ensureLink(ifc.Name)
@@ -44,9 +60,16 @@ func Up(ifc *store.Interface, peers []store.Peer) error {
 		}
 	}
 
+	policyV4, policyV6 := DefaultRouteFamilies(peers)
+	table := policyTable(ifc)
+
 	cfg, err := deviceConfig(ifc, peers)
 	if err != nil {
 		return err
+	}
+	if policyV4 || policyV6 {
+		mark := table
+		cfg.FirewallMark = &mark
 	}
 	c, err := wgctrl.New()
 	if err != nil {
@@ -61,7 +84,7 @@ func Up(ifc *store.Interface, peers []store.Peer) error {
 		return fmt.Errorf("link up: %w", err)
 	}
 
-	if err := installRoutes(link, ifc, peers); err != nil {
+	if err := installRoutes(link, ifc, peers, policyV4, policyV6, table); err != nil {
 		return err
 	}
 
@@ -73,8 +96,8 @@ func Up(ifc *store.Interface, peers []store.Peer) error {
 	return nil
 }
 
-// Down runs PostDown (best effort), then removes the device — addresses
-// and routes go with it.
+// Down runs PostDown (best effort), removes policy-routing rules, then the
+// device — addresses and routes go with it.
 func Down(ifc *store.Interface) error {
 	link, err := netlink.LinkByName(ifc.Name)
 	if err != nil {
@@ -85,6 +108,7 @@ func Down(ifc *store.Interface) error {
 			fmt.Fprintf(os.Stderr, "warning: PostDown failed: %v\n", err)
 		}
 	}
+	cleanPolicyRules(policyTable(ifc))
 	return netlink.LinkDel(link)
 }
 
@@ -225,10 +249,30 @@ func ipNet(p netip.Prefix) net.IPNet {
 	}
 }
 
-// installRoutes adds a route per peer allowed-IP network that is not already
-// covered by the tunnel subnet. Default routes are skipped with a warning:
-// policy routing (fwmark/Table tricks) is out of scope for M1.
-func installRoutes(link netlink.Link, ifc *store.Interface, peers []store.Peer) error {
+// installRoutes adds a route per peer allowed-IP network not already covered
+// by the tunnel subnet. When a default route is present, wg-quick-style
+// policy routing is installed instead: the default (and everything else)
+// lives in a separate table, fwmark keeps the tunnel's own UDP on the main
+// table, and "table main suppress_prefixlength 0" preserves more-specific
+// main-table routes (like the one to the controller).
+func installRoutes(link netlink.Link, ifc *store.Interface, peers []store.Peer, policyV4, policyV6 bool, table int) error {
+	if policyV4 || policyV6 {
+		if err := cleanPolicyRules(table); err != nil {
+			return err
+		}
+		if policyV4 {
+			if err := addPolicyRoute(link, table, unix.AF_INET); err != nil {
+				return err
+			}
+		}
+		if policyV6 {
+			if err := addPolicyRoute(link, table, unix.AF_INET6); err != nil {
+				return err
+			}
+		}
+		return installPolicyRules(table, policyV4, policyV6)
+	}
+
 	tunnel, err := netip.ParsePrefix(ifc.Address)
 	if err != nil {
 		return fmt.Errorf("interface address %q: %w", ifc.Address, err)
@@ -246,10 +290,6 @@ func installRoutes(link netlink.Link, ifc *store.Interface, peers []store.Peer) 
 			if err != nil {
 				return fmt.Errorf("peer %q allowed IP %q: %w", p.Name, s, err)
 			}
-			if prefix.Bits() == 0 {
-				fmt.Fprintf(os.Stderr, "warning: peer %q: default route via allowed IP %q skipped (policy routing not supported yet)\n", p.Name, s)
-				continue
-			}
 			if prefix.Addr().Is4() == tunnel.Addr().Is4() &&
 				tunnel.Contains(prefix.Addr()) && prefix.Bits() >= tunnel.Bits() {
 				continue // covered by the connected route
@@ -264,6 +304,101 @@ func installRoutes(link netlink.Link, ifc *store.Interface, peers []store.Peer) 
 				return fmt.Errorf("add route %s: %w", n.String(), err)
 			}
 		}
+	}
+	return nil
+}
+
+// DefaultRouteFamilies reports whether the peer set contains an IPv4/IPv6
+// default route.
+func DefaultRouteFamilies(peers []store.Peer) (v4, v6 bool) {
+	for _, p := range peers {
+		for _, s := range strings.Split(p.AllowedIPs, ",") {
+			prefix, err := netip.ParsePrefix(strings.TrimSpace(s))
+			if err != nil || prefix.Bits() != 0 {
+				continue
+			}
+			if prefix.Addr().Is4() {
+				v4 = true
+			} else {
+				v6 = true
+			}
+		}
+	}
+	return v4, v6
+}
+
+// policyTable resolves the routing table: a numeric route_table setting
+// wins, otherwise the wg-quick default.
+func policyTable(ifc *store.Interface) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(ifc.RouteTable)); err == nil && n > 0 {
+		return n
+	}
+	return defaultPolicyTable
+}
+
+// addPolicyRoute puts the family's default route into the policy table.
+func addPolicyRoute(link netlink.Link, table, family int) error {
+	var dst net.IPNet
+	if family == unix.AF_INET {
+		dst = net.IPNet{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)}
+	} else {
+		dst = net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)}
+	}
+	route := netlink.Route{LinkIndex: link.Attrs().Index, Dst: &dst, Table: table}
+	if err := netlink.RouteAdd(&route); err != nil && !errors.Is(err, syscall.EEXIST) {
+		return fmt.Errorf("add policy route (table %d): %w", table, err)
+	}
+	return nil
+}
+
+// installPolicyRules adds the two wg-quick rules per family:
+//
+//	32765: not fwmark <table> lookup <table>   (unmarked traffic → tunnel)
+//	32764: lookup main suppress_prefixlength 0 (keep specific main routes)
+func installPolicyRules(table int, v4, v6 bool) error {
+	families := []int{}
+	if v4 {
+		families = append(families, unix.AF_INET)
+	}
+	if v6 {
+		families = append(families, unix.AF_INET6)
+	}
+	for _, family := range families {
+		mark := uint32(table)
+		r1 := netlink.NewRule()
+		r1.Family, r1.Priority, r1.Table = family, rulePrioTunnel, table
+		r1.Mark, r1.Mask, r1.Invert = mark, &r1Mask, true
+		if err := netlink.RuleAdd(r1); err != nil {
+			return fmt.Errorf("add rule not-fwmark: %w", err)
+		}
+		r2 := netlink.NewRule()
+		r2.Family, r2.Priority, r2.Table = family, rulePrioMainSupp, unix.RT_TABLE_MAIN
+		r2.SuppressPrefixlen = 0
+		if err := netlink.RuleAdd(r2); err != nil {
+			return fmt.Errorf("add rule main-suppress: %w", err)
+		}
+	}
+	return nil
+}
+
+// r1Mask makes "fwmark <table>" match exactly the table's mark bit.
+var r1Mask uint32 = 0xffffffff
+
+// cleanPolicyRules removes the policy rules (idempotent, errors ignored:
+// missing rules are the common case).
+func cleanPolicyRules(table int) error {
+	mark := uint32(table)
+	mask := uint32(0xffffffff)
+	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+		r1 := netlink.NewRule()
+		r1.Family, r1.Priority, r1.Table = family, rulePrioTunnel, table
+		r1.Mark, r1.Mask, r1.Invert = mark, &mask, true
+		_ = netlink.RuleDel(r1)
+
+		r2 := netlink.NewRule()
+		r2.Family, r2.Priority, r2.Table = family, rulePrioMainSupp, unix.RT_TABLE_MAIN
+		r2.SuppressPrefixlen = 0
+		_ = netlink.RuleDel(r2)
 	}
 	return nil
 }
