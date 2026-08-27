@@ -1,4 +1,4 @@
-module wgmgt
+module github.com/gexqin/wgmgt
 
 go 1.27
 

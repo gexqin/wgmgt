@@ -1,7 +1,7 @@
 // Command wgmgt is the WGMGT binary.
 package main
 
-import "wgmgt/internal/cli"
+import "github.com/gexqin/wgmgt/internal/cli"
 
 func main() {
 	cli.Execute()

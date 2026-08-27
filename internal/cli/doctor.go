@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"wgmgt/internal/wgkern"
+	"github.com/gexqin/wgmgt/internal/wgkern"
 )
 
 var errIncompatible = errors.New("system incompatible: kernel WireGuard not found")
