@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"net/netip"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/gexqin/wgmgt/internal/store"
+	"github.com/gexqin/wgmgt/internal/wgctl"
 	"github.com/gexqin/wgmgt/internal/wgkern"
 )
 
@@ -32,6 +34,10 @@ var initCmd = &cobra.Command{
 			return err
 		}
 		defer st.Close()
+
+		if err := offerStopForeignWG(cmd, st); err != nil {
+			return err
+		}
 
 		name := initFlags.name
 		if !cmd.Flags().Changed("name") {
@@ -91,6 +97,60 @@ var initCmd = &cobra.Command{
 		fmt.Fprintf(out, "\nNext: `wgmgt peer add %s` then `sudo wgmgt up %s`\n", name, name)
 		return nil
 	},
+}
+
+// offerStopForeignWG warns about WireGuard devices that are up but not
+// managed by wgmgt (typically a wg-quick service) and offers to stop them —
+// a service left running would fight wgmgt over the device and its routing.
+func offerStopForeignWG(cmd *cobra.Command, st *store.Store) error {
+	devices, err := wgctl.RunningDevices()
+	if err != nil {
+		// Read-only probing; don't block init on it.
+		fmt.Fprintf(cmd.OutOrStderr(), "warning: cannot list running WireGuard devices: %v\n", err)
+		return nil
+	}
+	managed, err := st.ListInterfaces("")
+	if err != nil {
+		return err
+	}
+	ours := make(map[string]bool, len(managed))
+	for _, ifc := range managed {
+		ours[ifc.Name] = true
+	}
+	var foreign []string
+	for _, name := range devices {
+		if !ours[name] {
+			foreign = append(foreign, name)
+		}
+	}
+	if len(foreign) == 0 {
+		return nil
+	}
+
+	out := cmd.OutOrStderr()
+	fmt.Fprintf(out, "\nWireGuard device(s) already up but not managed by wgmgt: %s\n",
+		strings.Join(foreign, ", "))
+	fmt.Fprintf(out, "A wg-quick service left running will fight wgmgt over the device.\n")
+	if !confirm("Stop them now?", false) {
+		fmt.Fprintf(out, "Leaving them running; a name collision will make `wgmgt up` fail.\n")
+		return nil
+	}
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	for _, name := range foreign {
+		byService, err := wgctl.StopExternal(name)
+		if err != nil {
+			fmt.Fprintf(out, "  %s: %v\n", name, err)
+			continue
+		}
+		if byService {
+			fmt.Fprintf(out, "  %s: stopped wg-quick@%s.service (consider `systemctl disable` to keep it down across reboots)\n", name, name)
+		} else {
+			fmt.Fprintf(out, "  %s: device removed\n", name)
+		}
+	}
+	return nil
 }
 
 func init() {

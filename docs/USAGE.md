@@ -63,6 +63,12 @@ WireGuard 客户端即可连接。
 | `--mtu` | 内核默认 | |
 | `--dns` | 无 | 下发给客户端的 DNS |
 
+init 还会检查是否已有**非 wgmgt 管理**的 WireGuard 接口在运行(典型是
+wg-quick 服务拉起的):有则列出并询问是否停止——留着会和 wgmgt 抢设备
+和路由。选停止时,若接口由 `wg-quick@<名>.service` 提供,优先停服务
+(让它自己清策略路由),否则直接删设备;非交互环境默认不停,仅告警。
+注意停服务不等于禁用,重启后服务仍会拉起,需 `systemctl disable`。
+
 ### `wgmgt up|down [interface]`(需 root)
 
 `up`:创建链路 → 配地址 → 下发 WG 配置(含全部 peer)→ 加路由。
@@ -112,8 +118,18 @@ WGMGT web UI: http://127.0.0.1:8080/t/913fc4cf45d2…/
 
 - **鉴权**:每次启动生成随机 token,嵌在 URL 路径里——没有这个 URL
   的请求一律 404(同时挡住扫描器和浏览器 CSRF/DNS-rebinding)
-- **默认只听 127.0.0.1**;`--port` 指定端口,`--global` 才暴露到网络
-  (明文 HTTP,自担风险;优先走反向代理加 TLS 或 SSH 隧道)
+- **刻意不内置 HTTPS**:Web UI 只做明文 HTTP。默认仅听 127.0.0.1
+  (本机安全);需要远程访问时,`--port` 换端口 + **反向代理加 TLS**
+  (推荐)或 SSH 隧道。`--global` 直接裸奔明文 HTTP,自担风险。
+  典型反代配置(`wgmgt web --port 8080` 本机回环,caddy 一行):
+  ```
+  vpn.example.com {
+      reverse_proxy 127.0.0.1:8080
+  }
+  ```
+  nginx 等价写法:`proxy_pass http://127.0.0.1:8080;`(代理不要改写
+  路径,token 在 URL 里)。`server` 的内置 CA 只服务 agent mTLS
+  API(:8443),与 Web 控制台无关
 - **功能**:仪表盘(接口卡片与状态)、接口详情(统计磁贴 + peer 表,
   5 秒自动刷新握手/流量)、表单加 peer(常用项 + 高级折叠区,对应
   双模式设计)、Up/Down 按钮、查看/复制客户端 conf

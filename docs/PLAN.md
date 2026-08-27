@@ -25,6 +25,7 @@
 | 12 | Web UI 选型(2026-08-27 补) | **HTMX + 纯静态模板**,零前端构建链,embed 体积最小(M2) |
 | 13 | server↔agent 协议(2026-08-27 定;同日升级长轮询) | **JSON + TLS + mTLS**;agent 主动外连(NAT 后路由器唯一可行方向),pull 模型 **HTTP 长轮询**(hold 25s,store 变更钩子即时唤醒,状态随轮询上报);agent 证书即身份,可吊销。gRPC 因路由器体积/内存硬约束被否 |
 | 14 | 许可证(2026-08-27 定) | **PolyForm Noncommercial 1.0.0**——允许非商业用途(个人/研究/教育/公益/政府),禁止商用。严格说是 source-available 而非 OSI 开源;后果:进不了 OpenWrt 官方源(M4 走侧载/自建源),梅林插件影响较小 |
+| 15 | Web UI 的 TLS(2026-08-27 定) | **不内置 HTTPS**:Web 控制台刻意只做明文 HTTP,默认仅回环;暴露到网络的场景由**反向代理**(nginx/caddy 等)或 SSH 隧道提供 TLS。不自带证书管理,避免与系统级反代/ACME 重复造轮子。注意区分:`server` 内置 CA 只服务 agent mTLS API(:8443),与 Web 控制台无关 |
 
 ### 硬约束的推论
 

@@ -29,3 +29,28 @@ func isTerminal(f *os.File) bool {
 	st, err := f.Stat()
 	return err == nil && st.Mode()&os.ModeCharDevice != 0
 }
+
+// confirm asks a yes/no question over a terminal. Non-terminal stdin
+// (scripts, pipes) just gets the default.
+func confirm(label string, def bool) bool {
+	if !isTerminal(os.Stdin) {
+		return def
+	}
+	hint := "[y/N]"
+	if def {
+		hint = "[Y/n]"
+	}
+	fmt.Printf("%s %s: ", label, hint)
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes":
+		return true
+	case "n", "no":
+		return false
+	default:
+		return def
+	}
+}
