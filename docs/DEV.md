@@ -11,11 +11,25 @@
 
 ```sh
 go build ./...              # 编译所有包
-go build -o wgmgt ./cmd/wgmgt   # 产出二进制
 go vet ./...                # 静态检查
 go test ./...               # 单元测试
 go test -race ./...         # 竞态检测(CI 用)
 ```
+
+发布/部署用二进制(静态、注入版本号,产物名固定 `wgmgt`):
+
+```sh
+CGO_ENABLED=0 go build -trimpath \
+  -ldflags="-s -w \
+    -X github.com/gexqin/wgmgt/internal/cli.version=$(git describe --tags --always) \
+    -X github.com/gexqin/wgmgt/internal/cli.commit=$(git rev-parse --short HEAD)" \
+  -o wgmgt ./cmd/wgmgt
+./wgmgt version             # 验证:wgmgt v0.1.0 (5ecca4c) linux/amd64
+```
+
+版本号基线:**v0.1.0 = M3 完成**(单机 CLI/Web/多节点主控+agent 全部可用)。
+`git describe --tags` 自动产出 `v0.1.0` / `v0.1.0-3-g1a2b3c4` 式版本串,
+M5 的语义化版本流程直接沿用此机制。
 
 交叉编译(M4 会做成发布矩阵):
 
