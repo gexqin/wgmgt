@@ -1,6 +1,6 @@
 # WGMGT 项目计划
 
-> 规划定稿于 2026-08-27,随开发滚动更新。当前状态:**M0–M3 已完成**(基线 v0.1.0,2026-08-29),下一步 M4 平台适配。
+> 规划定稿于 2026-08-27,随开发滚动更新。当前状态:**M0–M3 已完成**(基线 v0.1.0,2026-08-29;2026-09-01 增补 token 引导注册与控制台 peer/token 管理,见决策 #16),下一步 M4 平台适配。
 
 ## 一句话定位
 
@@ -26,6 +26,7 @@
 | 13 | server↔agent 协议(2026-08-27 定;同日升级长轮询) | **JSON + TLS + mTLS**;agent 主动外连(NAT 后路由器唯一可行方向),pull 模型 **HTTP 长轮询**(hold 25s,store 变更钩子即时唤醒,状态随轮询上报);agent 证书即身份,可吊销。gRPC 因路由器体积/内存硬约束被否 |
 | 14 | 许可证(2026-08-27 定) | **PolyForm Noncommercial 1.0.0**——允许非商业用途(个人/研究/教育/公益/政府),禁止商用。严格说是 source-available 而非 OSI 开源;后果:进不了 OpenWrt 官方源(M4 走侧载/自建源),梅林插件影响较小 |
 | 15 | Web UI 的 TLS(2026-08-27 定) | **不内置 HTTPS**:Web 控制台刻意只做明文 HTTP,默认仅回环;暴露到网络的场景由**反向代理**(nginx/caddy 等)或 SSH 隧道提供 TLS。不自带证书管理,避免与系统级反代/ACME 重复造轮子。注意区分:`server` 内置 CA 只服务 agent mTLS API(:8443),与 Web 控制台无关 |
+| 16 | agent 引导注册(2026-09-01 定,基线后增量) | **一次性 token 引导**:控制台「Add node」表单或 `wgmgt server token <name>` 铸 token(48 字符、单次使用、24h、库中只存哈希);节点上一条命令 `wgmgt agent --token … --ca-hash …` 自主完成。**agent 本地生成密钥对、只上传公钥**(私钥不出节点);首连信任用 `--ca-hash` 钉根证书指纹(kubeadm join 风格),服务端出示链带根证书;同端口 TLS `VerifyClientCertIfGiven`,poll 路由在 handler 层强制客户端证书。手动 `server enroll` 保留为兼容路径 |
 
 ### 硬约束的推论
 
