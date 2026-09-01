@@ -147,7 +147,7 @@ WGMGT web UI: http://127.0.0.1:8080/t/913fc4cf45d2…/
 - 零前端构建链:HTML 模板 + 手写 CSS + 内嵌 htmx(go:embed),
   浅色/深色自适应
 
-### `wgmgt server` / `wgmgt server enroll` / `wgmgt agent`(需 root,M3)
+### `wgmgt server` / `wgmgt server token` / `wgmgt agent`(需 root,M3)
 
 集中管理多节点。协议:JSON + TLS + mTLS,agent 主动外连(NAT 后的
 节点唯一可行方向),**HTTP 长轮询**拉取配置——控制台一改,毫秒级
@@ -163,14 +163,33 @@ sudo wgmgt server                       # 首次启动自动生成 CA 与服务�
 sudo wgmgt server --api :9443 --web 9090 --web-global
                                         # agent API 换 9443,控制台 9090 且监听全网卡
 
-# 2. 签发 agent 证书(每个节点一次)
-sudo wgmgt server enroll router1 --out .
-#  → router1.pem / router1.key / ca.pem,拷到目标节点
+# 2. 添加节点:生成一次性注册 token(每个节点一次)
+sudo wgmgt server token router1         # 或控制台「Add node」表单
+#  → 打印一条完整的 join 命令(含 token 与 --ca-hash)
 
-# 3. 目标节点上
+# 3. 目标节点上,复制粘贴 join 命令即可
 sudo wgmgt agent --server https://控制端:8443 \
-    --ca ca.pem --cert router1.pem --key router1.key
+    --token <一次性token> --ca-hash sha256:<控制端CA指纹>
+#  → 自动生成密钥对、换取证书、落盘到 --conf-dir,随即进入正常轮询
 ```
+
+注册(token enrollment)安全模型:
+
+- **一次性 token**:48 字符,24 小时有效,单次使用即烧毁;库里只存
+  哈希。烧毁在签证书**之前**(fail-closed:失败请求绝不可能签出第二张
+  证书),但格式校验在烧毁之前(坏请求不浪费 token)
+- **私钥不出节点**:agent 在本地生成 ECDSA P-256 密钥对,注册请求只
+  携带公钥;控制端为该公钥签发证书,MITM 拿不到私钥
+- **CA pinning**:引导时 agent 尚无 CA,`--ca-hash` 把控制端根证书
+  指纹钉死(kubeadm join 同款思路),防止首连被中间人劫持;服务端
+  出示链尾部带根证书以供比对
+- token 在命令行上短暂可见(`ps`),与 kubeadm 同款 tradeoff;
+  join 命令页在控制台只显示一次
+- 证书材料落盘 `--conf-dir`(ca.pem / agent.pem / agent.key,key 0600),
+  agent 重启时检测到已有材料会**跳过注册**(token 已烧毁),直接复用
+
+旧的 `wgmgt server enroll`(控制端本地签发证书 + 手工拷贝三个 PEM
+文件)仍然可用,适合不方便传递 token 的场景。
 
 常用 flag:
 
@@ -181,9 +200,12 @@ sudo wgmgt agent --server https://控制端:8443 \
 | | `--web-global` | 关 | 控制台监听全网卡(默认仅 127.0.0.1;明文 HTTP 有警告) |
 | | `--poll-hold` | `25s` | 长轮询挂起上限(0 = 立即应答;须 < agent 的 60s 响应超时) |
 | | `--dir` | `/etc/wireguard/wgmgt/server` | 控制端状态目录(CA + 数据库) |
-| `agent` | `--interval` | `30s` | 失败重试退避(正常节奏由服务端长轮询驱动) |
+| `server token` | `--ttl` | `24h` | 注册 token 有效期 |
+| `agent` | `--token` | — | 一次性注册 token(引导路径;须配合 `--ca-hash`) |
+| | `--ca-hash` | — | 控制端 CA 指纹(`sha256:<hex>` 或裸 hex,join 命令里带) |
+| | `--interval` | `30s` | 失败重试退避(正常节奏由服务端长轮询驱动) |
 | | `--verify-timeout` | `180s` | 看门狗:超时未验证即回退(0 关闭) |
-| | `--conf-dir` | `/etc/wireguard/wgmgt-agent` | 生成 conf 的目录 |
+| | `--conf-dir` | `/etc/wireguard/wgmgt-agent` | 生成 conf 与注册材料的目录 |
 
 #### 全隧道(0.0.0.0/0)与自锁保护
 
@@ -214,6 +236,12 @@ fwmark 标记隧道自身流量、默认路由进独立路由表(51820)、
 
 - **节点总览**:在线状态(上报新鲜度)、接口数、最近上报时间、
   隔离徽章
+- **添加节点**:表单填名字 → 生成一次性 token,展示完整 join 命令
+  (仅显示一次;刷新即 404,重铸即可)
+- **节点详情页**:接口卡片、**Quick add peer**(选接口 + 名字,一步加
+  peer)、**Enrollment** 区(注册状态/未兑换 token 的有效期、一键重铸
+  token——重铸会吊销该节点旧的未兑换 token;对已注册节点即重新注册,
+  新证书自动取代旧证书)
 - **节点详情 / 建接口**:表单向导(名称/地址/端口/MTU),agent 长轮询
   被即时唤醒,变更毫秒级生效
 - **接口详情**:与单机版一致,但握手/流量来自 agent 实时上报;

@@ -3,7 +3,10 @@ package store
 import (
 	"errors"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func open(t *testing.T) *Store {
@@ -219,5 +222,120 @@ func TestChangeHookFires(t *testing.T) {
 	s.OnChange = nil
 	if err := s.SetEnabled("n1", "wg0", true); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEnrollTokenLifecycle(t *testing.T) {
+	s := open(t)
+	token, err := s.CreateEnrollToken("router1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(token) != 48 { // 24 bytes hex
+		t.Fatalf("token len = %d, want 48", len(token))
+	}
+
+	node, err := s.RedeemEnrollToken(token)
+	if err != nil || node != "router1" {
+		t.Fatalf("redeem = %q, %v", node, err)
+	}
+	if _, err := s.RedeemEnrollToken(token); !errors.Is(err, ErrNotFound) {
+		t.Error("double redeem must fail")
+	}
+	if _, err := s.RedeemEnrollToken("bogus"); !errors.Is(err, ErrNotFound) {
+		t.Error("unknown token must fail identically")
+	}
+
+	toks, err := s.ListEnrollTokens("")
+	if err != nil || len(toks) != 0 {
+		t.Errorf("used token still listed: %v, %v", toks, err)
+	}
+
+	// Expired tokens cannot be redeemed and are lazily deleted.
+	expired, err := s.CreateEnrollToken("router2", -time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedeemEnrollToken(expired); !errors.Is(err, ErrNotFound) {
+		t.Error("expired token redeemed")
+	}
+	fresh, _ := s.CreateEnrollToken("router3", time.Hour) // triggers lazy cleanup
+	if _, err := s.RedeemEnrollToken(expired); !errors.Is(err, ErrNotFound) {
+		t.Error("expired token redeemed after cleanup")
+	}
+	if _, err := s.RedeemEnrollToken(fresh); err != nil {
+		t.Fatal(err)
+	}
+
+	// Revocation removes outstanding tokens only.
+	t1, _ := s.CreateEnrollToken("router1", time.Hour)
+	t2, _ := s.CreateEnrollToken("other", time.Hour)
+	if err := s.DeleteEnrollTokens("router1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.RedeemEnrollToken(t1); !errors.Is(err, ErrNotFound) {
+		t.Error("revoked token redeemed")
+	}
+	if _, err := s.RedeemEnrollToken(t2); err != nil {
+		t.Error("revocation must not touch other nodes' tokens")
+	}
+}
+
+func TestEnrollTokenConcurrentRedeem(t *testing.T) {
+	s := open(t)
+	token, err := s.CreateEnrollToken("n1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var ok atomic.Int32
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := s.RedeemEnrollToken(token); err == nil {
+				ok.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if ok.Load() != 1 {
+		t.Errorf("exactly one redeem must succeed, got %d", ok.Load())
+	}
+}
+
+func TestValidNodeName(t *testing.T) {
+	for _, ok := range []string{"a", "router1", "node-2", "a.b_c", "AbC123"} {
+		if !ValidNodeName(ok) {
+			t.Errorf("ValidNodeName(%q) = false", ok)
+		}
+	}
+	for _, bad := range []string{"", "-a", "a/b", "a b", ".", "a:b", string(make([]byte, 65))} {
+		if ValidNodeName(bad) {
+			t.Errorf("ValidNodeName(%q) = true", bad)
+		}
+	}
+}
+
+func TestEnsureNodePendingKeepsFingerprint(t *testing.T) {
+	s := open(t)
+	if err := s.EnsureNode("n1", "AA:BB"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureNodePending("n1"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.GetNode("n1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n.Fingerprint != "AA:BB" {
+		t.Errorf("fingerprint = %q, want AA:BB (pending must not clobber)", n.Fingerprint)
+	}
+	if err := s.EnsureNodePending("n2"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.GetNode("n2"); err != nil || n.Fingerprint != "" {
+		t.Errorf("new pending node = %+v, %v", n, err)
 	}
 }

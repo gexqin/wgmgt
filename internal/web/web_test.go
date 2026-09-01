@@ -1,6 +1,7 @@
 package web
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
@@ -158,7 +160,10 @@ func TestIfaceCreateRejectsPathTraversal(t *testing.T) {
 	if err := st.EnsureNode("n1", "fp"); err != nil {
 		t.Fatal(err)
 	}
-	srv, err := NewController(&app.App{Store: st, ConfDir: dir}, control.NewReports())
+	srv, err := NewController(&app.App{Store: st, ConfDir: dir}, control.NewReports(), ControllerOpts{
+		APIURL:        "https://ctrl:8443",
+		CAFingerprint: strings.Repeat("a", 64),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,5 +227,160 @@ func TestConfGeneratedOnPeerAdd(t *testing.T) {
 	conf := string(confBytes)
 	if !strings.Contains(conf, "[Peer]") {
 		t.Errorf("conf missing peer:\n%s", conf)
+	}
+}
+
+// newControllerServer builds a controller-mode test server.
+func newControllerServer(t *testing.T) (*httptest.Server, string, *store.Store) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	srv, err := NewController(&app.App{Store: st, ConfDir: dir}, control.NewReports(), ControllerOpts{
+		APIURL:        "https://ctrl:8443",
+		CAFingerprint: strings.Repeat("ab", 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	return ts, "/t/" + srv.Token(), st
+}
+
+func TestNodeAddShowsJoinCommand(t *testing.T) {
+	ts, prefix, st := newControllerServer(t)
+
+	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/nodes", url.Values{"name": {"router9"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("node add = %d, want 303", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+
+	code, body := get(t, ts, loc)
+	if code != http.StatusOK || !strings.Contains(body, "--token") ||
+		!strings.Contains(body, "--ca-hash sha256:") || !strings.Contains(body, "wgmgt agent") {
+		t.Fatalf("join page = %d, body missing command:\n%s", code, body)
+	}
+
+	// The page is one-time: a second GET must 404.
+	if code, _ := get(t, ts, loc); code != http.StatusNotFound {
+		t.Errorf("second view = %d, want 404", code)
+	}
+
+	// The pending node appears on the dashboard.
+	if code, body := get(t, ts, prefix+"/"); code != http.StatusOK || !strings.Contains(body, "router9") {
+		t.Errorf("node not on dashboard (code %d)", code)
+	}
+
+	// A redeemable token really exists for the node.
+	toks, err := st.ListEnrollTokens("")
+	if err != nil || len(toks) != 1 || toks[0].Node != "router9" {
+		t.Errorf("outstanding tokens = %v, %v", toks, err)
+	}
+}
+
+func TestNodeAddValidatesName(t *testing.T) {
+	ts, prefix, _ := newControllerServer(t)
+	for _, bad := range []string{"", "a/b", "lead ing", "-x"} {
+		resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/nodes", url.Values{"name": {bad}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("name %q = %d, want 400", bad, resp.StatusCode)
+		}
+	}
+}
+
+func TestNodeTokenRemintRevokesOld(t *testing.T) {
+	ts, prefix, st := newControllerServer(t)
+	if err := st.EnsureNodePending("n1"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.CreateEnrollToken("n1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/node/n1/token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("re-mint = %d, want 303", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	if code, body := get(t, ts, loc); code != http.StatusOK || !strings.Contains(body, "--token") {
+		t.Fatalf("join page after re-mint = %d", code)
+	}
+
+	// The old token was revoked; exactly one new one is outstanding.
+	if _, err := st.RedeemEnrollToken(first); !errors.Is(err, store.ErrNotFound) {
+		t.Error("old token must be revoked by re-mint")
+	}
+	toks, err := st.ListEnrollTokens("n1")
+	if err != nil || len(toks) != 1 {
+		t.Errorf("outstanding tokens after re-mint = %v, %v", toks, err)
+	}
+}
+
+func TestQuickAddPeerOnNodePage(t *testing.T) {
+	ts, prefix, st := newControllerServer(t)
+	st.EnsureNode("n1", "fp")
+	key, _ := wgtypes.GeneratePrivateKey()
+	if err := st.CreateInterface(&store.Interface{Node: "n1", Name: "wg0", PrivateKey: key.String(), Address: "10.7.0.1/24", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The node page renders the quick-add form with the interface select.
+	code, body := get(t, ts, prefix+"/node/n1")
+	if code != http.StatusOK || !strings.Contains(body, `name="iface"`) || !strings.Contains(body, "Quick add peer") {
+		t.Fatalf("node page missing quick-add (code %d)", code)
+	}
+
+	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/node/n1/peers", url.Values{
+		"iface": {"wg0"}, "name": {"laptop"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("quick add = %d, want 303", resp.StatusCode)
+	}
+	peers, err := st.ListPeers("n1", "wg0")
+	if err != nil || len(peers) != 1 || peers[0].Name != "laptop" {
+		t.Fatalf("peers after quick add = %v, %v", peers, err)
+	}
+	if peers[0].AllowedIPs != "10.7.0.2/32" {
+		t.Errorf("auto allowed IP = %q, want 10.7.0.2/32", peers[0].AllowedIPs)
+	}
+
+	// Unknown interface is a 404, missing choice a 400.
+	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/node/n1/peers", url.Values{"iface": {"nope"}, "name": {"x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown iface = %d, want 404", resp.StatusCode)
+	}
+	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/node/n1/peers", url.Values{"name": {"x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("missing iface = %d, want 400", resp.StatusCode)
 	}
 }

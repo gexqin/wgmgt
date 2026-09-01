@@ -1,6 +1,11 @@
 package certs
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"os"
@@ -123,6 +128,98 @@ func TestFingerprint(t *testing.T) {
 	if err != nil || len(fp) != 64 { // hex sha256
 		t.Errorf("fingerprint = %q, %v", fp, err)
 	}
+}
+
+func TestNewAgentCertFromKey(t *testing.T) {
+	ca, err := NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+
+	certPEM, err := ca.NewAgentCertFromKey("node7", pubPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := parse(t, certPEM)
+	if cert.Subject.CommonName != "node7" {
+		t.Errorf("CN = %q, want node7", cert.Subject.CommonName)
+	}
+	if err := cert.CheckSignatureFrom(ca.Cert); err != nil {
+		t.Errorf("cert not signed by CA: %v", err)
+	}
+	got := cert.PublicKey.(*ecdsa.PublicKey)
+	if got.X.Cmp(key.PublicKey.X) != 0 || got.Y.Cmp(key.PublicKey.Y) != 0 {
+		t.Error("cert public key differs from the submitted key")
+	}
+	// The issued pair must be usable as a TLS client certificate.
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: mustMarshalECKey(t, key)})
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		t.Errorf("X509KeyPair: %v", err)
+	}
+}
+
+func TestNewAgentCertFromKeyRejectsBadInput(t *testing.T) {
+	ca, _ := NewCA()
+	if _, err := ca.NewAgentCertFromKey("n", []byte("not pem")); err == nil {
+		t.Error("garbage PEM accepted")
+	}
+
+	// RSA keys are rejected.
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _ := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
+	rsaPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+	if _, err := ca.NewAgentCertFromKey("n", rsaPEM); err == nil {
+		t.Error("RSA key accepted")
+	}
+
+	// Wrong curve is rejected.
+	p384, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _ = x509.MarshalPKIXPublicKey(&p384.PublicKey)
+	p384PEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+	if _, err := ca.NewAgentCertFromKey("n", p384PEM); err == nil {
+		t.Error("P-384 key accepted")
+	}
+}
+
+func TestCAHelpers(t *testing.T) {
+	ca, err := NewCA()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := ca.CAFingerprint()
+	if len(fp) != 64 {
+		t.Errorf("CAFingerprint len = %d, want 64", len(fp))
+	}
+	if fp != ca.CAFingerprint() {
+		t.Error("CAFingerprint not stable")
+	}
+	if got, err := Fingerprint(ca.CAPEM()); err != nil || got != fp {
+		t.Errorf("CAPEM fingerprint = %q (%v), want %q", got, err, fp)
+	}
+}
+
+func mustMarshalECKey(t *testing.T, key *ecdsa.PrivateKey) []byte {
+	t.Helper()
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return der
 }
 
 func parse(t *testing.T, pemBytes []byte) *x509.Certificate {

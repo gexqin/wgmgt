@@ -3,9 +3,14 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -57,14 +62,22 @@ func newPKI(t *testing.T, agentName string) pki {
 
 func newAPIServer(t *testing.T, st *store.Store, p pki, reports *Reports, hold time.Duration) (*httptest.Server, *API) {
 	t.Helper()
-	api := NewAPI(st, reports, hold)
+	api, err := NewAPI(st, p.ca, reports, hold)
+	if err != nil {
+		t.Fatal(err)
+	}
 	// The controller wires the store hook to the API (see cli/server.go);
 	// mirror it so long-poll tests exercise the real wake path.
 	st.OnChange = api.Notify
+	// Mirror API.Server's TLS setup: optional client certs (enrollment has
+	// none yet) and the CA appended to the presented chain for --ca-hash
+	// pinning.
+	presented := p.server
+	presented.Certificate = append(append([][]byte{}, p.server.Certificate...), p.ca.Cert.Raw)
 	srv := httptest.NewUnstartedServer(api.Handler())
 	srv.TLS = &tls.Config{
-		Certificates: []tls.Certificate{p.server},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
+		Certificates: []tls.Certificate{presented},
+		ClientAuth:   tls.VerifyClientCertIfGiven,
 		ClientCAs:    p.pool,
 		MinVersion:   tls.VersionTLS12,
 	}
@@ -242,10 +255,191 @@ func TestPollWithoutClientCertRejected(t *testing.T) {
 	defer st.Close()
 	p := newPKI(t, "n1")
 	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
-	// Plain client: TLS handshake itself fails (client cert required).
-	c := &http.Client{}
-	if _, err := c.Post(ts.URL+"/api/poll", "application/json", bytes.NewReader([]byte(`{}`))); err == nil {
-		t.Error("handshake without client cert should fail")
+	// TLS layer no longer demands a client cert (enrollment needs it open),
+	// so the rejection comes from the handler as a 401.
+	c := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		RootCAs:    p.pool,
+		MinVersion: tls.VersionTLS12,
+	}}}
+	resp, err := c.Post(ts.URL+"/api/poll", "application/json", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("poll without client cert = %d, want 401", resp.StatusCode)
+	}
+}
+
+// enrollPost posts an enrollment request with a certificate-less client
+// (the bootstrapping agent's situation).
+func enrollPost(t *testing.T, c *http.Client, url, token, pubPEM string) (int, EnrollResponse) {
+	t.Helper()
+	body, _ := json.Marshal(EnrollRequest{Token: token, PublicKey: pubPEM})
+	resp, err := c.Post(url+"/api/enroll", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var out EnrollResponse
+	json.NewDecoder(resp.Body).Decode(&out)
+	return resp.StatusCode, out
+}
+
+func plainClient(p pki) *http.Client {
+	return &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		RootCAs:    p.pool,
+		MinVersion: tls.VersionTLS12,
+	}}}
+}
+
+func agentPubPEM(t *testing.T) (pubPEM, keyPEM string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pubPEM = string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM = string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}))
+	return pubPEM, keyPEM
+}
+
+func TestEnrollIssuesCertForPublicKey(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.EnsureNodePending("node7"); err != nil {
+		t.Fatal(err)
+	}
+	token, err := st.CreateEnrollToken("node7", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := newPKI(t, "unused")
+	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
+
+	pubPEM, keyPEM := agentPubPEM(t)
+	code, resp := enrollPost(t, plainClient(p), ts.URL, token, pubPEM)
+	if code != http.StatusOK {
+		t.Fatalf("enroll = %d %+v", code, resp)
+	}
+	if resp.Node != "node7" || resp.CA == "" || resp.Cert == "" {
+		t.Fatalf("enroll response incomplete: %+v", resp)
+	}
+
+	// The issued certificate is signed by the CA for OUR public key.
+	block, _ := pem.Decode([]byte(resp.Cert))
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cert.Subject.CommonName != "node7" {
+		t.Errorf("cert CN = %q", cert.Subject.CommonName)
+	}
+	if err := cert.CheckSignatureFrom(p.ca.Cert); err != nil {
+		t.Errorf("cert not signed by controller CA: %v", err)
+	}
+	keyBlock, _ := pem.Decode([]byte(keyPEM))
+	key, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cert.PublicKey.(*ecdsa.PublicKey).Equal(&key.PublicKey) {
+		t.Error("cert key differs from the submitted public key")
+	}
+
+	// End-to-end: the enrolled material can poll over mTLS immediately.
+	pair, err := tls.X509KeyPair([]byte(resp.Cert), []byte(keyPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	caPool := x509.NewCertPool()
+	caPool.AddCert(p.ca.Cert)
+	c := &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		Certificates: []tls.Certificate{pair},
+		RootCAs:      caPool,
+		MinVersion:   tls.VersionTLS12,
+	}}}
+	if code, _ := poll(t, c, ts.URL, 0); code != http.StatusOK {
+		t.Errorf("post-enroll poll = %d, want 200", code)
+	}
+}
+
+func TestEnrollTokenSingleUse(t *testing.T) {
+	st, _ := store.Open(filepath.Join(t.TempDir(), "db"))
+	defer st.Close()
+	token, err := st.CreateEnrollToken("n1", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newPKI(t, "unused")
+	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
+	c := plainClient(p)
+	pubPEM, _ := agentPubPEM(t)
+
+	if code, _ := enrollPost(t, c, ts.URL, token, pubPEM); code != http.StatusOK {
+		t.Fatalf("first enroll = %d", code)
+	}
+	if code, _ := enrollPost(t, c, ts.URL, token, pubPEM); code != http.StatusForbidden {
+		t.Errorf("token reuse = %d, want 403", code)
+	}
+}
+
+func TestEnrollWrongToken(t *testing.T) {
+	st, _ := store.Open(filepath.Join(t.TempDir(), "db"))
+	defer st.Close()
+	p := newPKI(t, "unused")
+	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
+	pubPEM, _ := agentPubPEM(t)
+	if code, _ := enrollPost(t, plainClient(p), ts.URL, "bogus", pubPEM); code != http.StatusForbidden {
+		t.Errorf("wrong token = %d, want 403", code)
+	}
+}
+
+func TestEnrollBadPublicKey(t *testing.T) {
+	st, _ := store.Open(filepath.Join(t.TempDir(), "db"))
+	defer st.Close()
+	token, _ := st.CreateEnrollToken("n1", time.Hour)
+	p := newPKI(t, "unused")
+	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
+	// Malformed body does not waste the token...
+	if code, _ := enrollPost(t, plainClient(p), ts.URL, token, "not pem"); code != http.StatusBadRequest {
+		t.Errorf("garbage public key = %d, want 400", code)
+	}
+	// ...but a well-formed PEM with a rejected key burns it (fail-closed).
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, _ := x509.MarshalPKIXPublicKey(&rsaKey.PublicKey)
+	rsaPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der}))
+	if code, _ := enrollPost(t, plainClient(p), ts.URL, token, rsaPEM); code != http.StatusBadRequest {
+		t.Errorf("RSA public key = %d, want 400", code)
+	}
+	if code, _ := enrollPost(t, plainClient(p), ts.URL, token, rsaPEM); code != http.StatusForbidden {
+		t.Errorf("token should be burned after the failed issue, got %d", code)
+	}
+}
+
+func TestEnrollWithoutToken(t *testing.T) {
+	st, _ := store.Open(filepath.Join(t.TempDir(), "db"))
+	defer st.Close()
+	p := newPKI(t, "unused")
+	ts, _ := newAPIServer(t, st, p, NewReports(), 0)
+	pubPEM, _ := agentPubPEM(t)
+	if code, _ := enrollPost(t, plainClient(p), ts.URL, "", pubPEM); code != http.StatusForbidden {
+		t.Errorf("missing token = %d, want 403", code)
 	}
 }
 

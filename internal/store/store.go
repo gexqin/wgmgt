@@ -6,11 +6,15 @@
 package store
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"regexp"
+	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver, keeps cross-compilation CGO-free
 )
@@ -101,6 +105,14 @@ CREATE TABLE IF NOT EXISTS nodes (
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   last_seen   TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS enroll_tokens (
+  token_hash TEXT PRIMARY KEY,   -- hex sha256 of the plaintext token
+  node       TEXT NOT NULL,
+  created_at TEXT NOT NULL,      -- all three time columns are written from Go
+  expires_at TEXT NOT NULL,      -- as RFC3339 UTC; datetime('now') defaults
+  used_at    TEXT NOT NULL DEFAULT '' -- elsewhere do not sort with them
+);
+CREATE INDEX IF NOT EXISTS idx_enroll_tokens_node ON enroll_tokens(node);
 `
 	if _, err := db.Exec(ddl); err != nil {
 		return err
@@ -383,6 +395,104 @@ func (s *Store) GetNode(name string) (*Node, error) {
 var ifaceNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
 
 func ValidIfaceName(name string) bool { return ifaceNameRe.MatchString(name) }
+
+// ValidNodeName reports whether name is a safe node name: it ends up in
+// URLs and certificate CNs, so it must stay conservative.
+var nodeNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+
+func ValidNodeName(name string) bool { return nodeNameRe.MatchString(name) }
+
+// EnsureNodePending registers a node row without touching an existing
+// fingerprint (unlike EnsureNode, which overwrites it) — used when minting
+// an enrollment token so the dashboard can show the pending node.
+func (s *Store) EnsureNodePending(name string) error {
+	_, err := s.db.Exec("INSERT INTO nodes (name, fingerprint) VALUES (?, '') ON CONFLICT(name) DO NOTHING", name)
+	return err
+}
+
+// --- enrollment tokens ---
+
+// EnrollToken is a one-time bootstrap token record. Only the hash is
+// stored; the plaintext exists solely at creation time.
+type EnrollToken struct {
+	Node      string
+	CreatedAt string
+	ExpiresAt string
+	Used      bool
+}
+
+// CreateEnrollToken mints a one-time token for node, valid for ttl, and
+// piggybacks deletion of long-expired rows. Returns the plaintext token.
+func (s *Store) CreateEnrollToken(node string, ttl time.Duration) (string, error) {
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(raw)
+	sum := sha256.Sum256([]byte(token))
+	now := time.Now().UTC()
+	_, err := s.db.Exec(`INSERT INTO enroll_tokens (token_hash, node, created_at, expires_at) VALUES (?,?,?,?)`,
+		fmt.Sprintf("%x", sum), node, now.Format(time.RFC3339), now.Add(ttl).Format(time.RFC3339))
+	if err != nil {
+		return "", err
+	}
+	// Lazy cleanup of tokens that expired unused more than a day ago.
+	s.db.Exec("DELETE FROM enroll_tokens WHERE expires_at < ?", now.Add(-24*time.Hour).Format(time.RFC3339))
+	return token, nil
+}
+
+// RedeemEnrollToken atomically burns a token and returns its node.
+// ErrNotFound covers unknown, expired, and already-used — deliberately
+// indistinguishable to callers.
+func (s *Store) RedeemEnrollToken(token string) (string, error) {
+	sum := sha256.Sum256([]byte(token))
+	now := time.Now().UTC().Format(time.RFC3339)
+	res, err := s.db.Exec("UPDATE enroll_tokens SET used_at = ? WHERE token_hash = ? AND used_at = '' AND expires_at > ?",
+		now, fmt.Sprintf("%x", sum), now)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", fmt.Errorf("%w: enroll token", ErrNotFound)
+	}
+	var node string
+	if err := s.db.QueryRow("SELECT node FROM enroll_tokens WHERE token_hash = ?", fmt.Sprintf("%x", sum)).Scan(&node); err != nil {
+		return "", err
+	}
+	return node, nil
+}
+
+// ListEnrollTokens returns outstanding (unused, unexpired) tokens,
+// optionally limited to one node ("" = all nodes).
+func (s *Store) ListEnrollTokens(node string) ([]EnrollToken, error) {
+	q := "SELECT node, created_at, expires_at FROM enroll_tokens WHERE used_at = '' AND expires_at > ?"
+	args := []any{time.Now().UTC().Format(time.RFC3339)}
+	if node != "" {
+		q += " AND node = ?"
+		args = append(args, node)
+	}
+	q += " ORDER BY created_at"
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EnrollToken
+	for rows.Next() {
+		var t EnrollToken
+		if err := rows.Scan(&t.Node, &t.CreatedAt, &t.ExpiresAt); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// DeleteEnrollTokens revokes all outstanding tokens of a node.
+func (s *Store) DeleteEnrollTokens(node string) error {
+	_, err := s.db.Exec("DELETE FROM enroll_tokens WHERE node = ? AND used_at = ''", node)
+	return err
+}
 
 // --- internals ---
 

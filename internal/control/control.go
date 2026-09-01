@@ -11,6 +11,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -136,19 +137,58 @@ func (n *Notifier) WakeCh(node string) <-chan struct{} {
 	return ch
 }
 
+// EnrollRequest is the bootstrap request body — the one-time token plus
+// the agent's own public key (PEM "PUBLIC KEY", PKIX). The private key
+// never travels; the certificate is signed for this key.
+type EnrollRequest struct {
+	Token     string `json:"token"`
+	PublicKey string `json:"public_key"`
+}
+
+// EnrollResponse is the bootstrap response: the issued certificate, the CA
+// the agent must use for subsequent mTLS polls, and the confirmed node name.
+type EnrollResponse struct {
+	Node string `json:"node"`
+	CA   string `json:"ca"`   // CA certificate PEM
+	Cert string `json:"cert"` // agent certificate PEM
+}
+
+// CertIssuer signs agent certificates during token enrollment. It is
+// satisfied by *certs.CA; the interface keeps this package decoupled from
+// the PKI implementation.
+type CertIssuer interface {
+	NewAgentCertFromKey(name string, pubPEM []byte) ([]byte, error)
+	CAPEM() []byte
+}
+
 // API is the agent-facing HTTP API behind mTLS.
 type API struct {
 	store    *store.Store
+	issuer   CertIssuer
+	caCert   *x509.Certificate // parsed issuer.CAPEM(); pinned by agents via --ca-hash
 	reports  *Reports
 	hold     time.Duration
 	notifier *Notifier
 	shutdown atomic.Bool
 }
 
-// NewAPI builds the API. hold is the maximum time a current-version poll is
-// held waiting for changes (<= 0 answers immediately, no long-polling).
-func NewAPI(st *store.Store, reports *Reports, hold time.Duration) *API {
-	return &API{store: st, reports: reports, hold: hold, notifier: NewNotifier()}
+// NewAPI builds the API. issuer signs certificates for token enrollment
+// (nil disables /api/enroll); hold is the maximum time a current-version
+// poll is held waiting for changes (<= 0 answers immediately).
+func NewAPI(st *store.Store, issuer CertIssuer, reports *Reports, hold time.Duration) (*API, error) {
+	a := &API{store: st, issuer: issuer, reports: reports, hold: hold, notifier: NewNotifier()}
+	if issuer != nil {
+		block, _ := pem.Decode(issuer.CAPEM())
+		if block == nil {
+			return nil, errors.New("issuer CA PEM does not decode")
+		}
+		caCert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("issuer CA PEM: %v", err)
+		}
+		a.caCert = caCert
+	}
+	return a, nil
 }
 
 // Notify wakes a node's hanging polls; the controller wires the store's
@@ -173,17 +213,28 @@ func (a *API) WakeAll() {
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/poll", a.handlePoll)
+	mux.HandleFunc("POST /api/enroll", a.handleEnroll)
 	return mux
 }
 
-// Server builds the mTLS HTTP server.
+// Server builds the HTTP server for the agent API. Client certificates are
+// verified when presented but not required at the TLS layer: the
+// bootstrapping enrollment path (/api/enroll) authenticates by one-time
+// token and has no certificate yet. Every other route (handlePoll) rejects
+// certificate-less requests itself.
 func (a *API) Server(addr string, cert tls.Certificate, caPool *x509.CertPool) *http.Server {
+	// Serve the CA alongside the leaf so bootstrapping agents can pin the
+	// root via --ca-hash against the presented chain.
+	presented := cert
+	if a.caCert != nil {
+		presented.Certificate = append(append([][]byte{}, cert.Certificate...), a.caCert.Raw)
+	}
 	return &http.Server{
 		Addr:    addr,
 		Handler: a.Handler(),
 		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			ClientAuth:   tls.RequireAndVerifyClientCert,
+			Certificates: []tls.Certificate{presented},
+			ClientAuth:   tls.VerifyClientCertIfGiven,
 			ClientCAs:    caPool,
 			MinVersion:   tls.VersionTLS12,
 		},
@@ -191,6 +242,60 @@ func (a *API) Server(addr string, cert tls.Certificate, caPool *x509.CertPool) *
 		// long-poll responses. Header and idle times are still bounded.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
+	}
+}
+
+// handleEnroll exchanges a one-time token for a certificate signed for the
+// requester's public key. Token auth only — the bootstrapping agent has no
+// client certificate yet. The token is burned BEFORE signing (fail-closed:
+// a failed request can never mint a second certificate) but AFTER cheap
+// public-key shape checks, so malformed requests do not waste tokens.
+func (a *API) handleEnroll(w http.ResponseWriter, r *http.Request) {
+	if a.issuer == nil {
+		http.Error(w, "enrollment disabled", http.StatusServiceUnavailable)
+		return
+	}
+	var req EnrollRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Token == "" {
+		http.Error(w, "missing token", http.StatusForbidden)
+		return
+	}
+	if block, _ := pem.Decode([]byte(req.PublicKey)); block == nil {
+		http.Error(w, "invalid public key", http.StatusBadRequest)
+		return
+	}
+	node, err := a.store.RedeemEnrollToken(req.Token)
+	if errors.Is(err, store.ErrNotFound) {
+		http.Error(w, "invalid, expired, or already-used enrollment token", http.StatusForbidden)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	certPEM, err := a.issuer.NewAgentCertFromKey(node, []byte(req.PublicKey))
+	if err != nil {
+		// The token is already burned; the node needs a fresh one.
+		http.Error(w, "invalid public key ("+err.Error()+") — token consumed, mint a new one", http.StatusBadRequest)
+		return
+	}
+	fp, err := fingerprintPEM(certPEM)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := a.store.EnsureNode(node, fp); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(EnrollResponse{Node: node, CA: string(a.issuer.CAPEM()), Cert: string(certPEM)}); err != nil {
+		log.Printf("enroll response: %v", err)
 	}
 }
 
@@ -290,6 +395,19 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 func certFingerprint(cert *x509.Certificate) string {
 	sum := sha256.Sum256(cert.Raw)
 	return fmt.Sprintf("%x", sum)
+}
+
+// fingerprintPEM is the PEM variant of certFingerprint.
+func fingerprintPEM(certPEM []byte) (string, error) {
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return "", errors.New("no PEM block")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return "", err
+	}
+	return certFingerprint(cert), nil
 }
 
 func (a *API) configFor(node string) ([]AgentInterface, error) {

@@ -170,7 +170,7 @@ td.num { font-variant-numeric: tabular-nums; }
 
 .grid-form label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
 .grid-form input[type="text"], .grid-form input[type="number"],
-.grid-form input:not([type]) {
+.grid-form input:not([type]), .grid-form select {
   font: inherit;
   padding: 7px 10px;
   border: 1px solid var(--border);
@@ -178,7 +178,7 @@ td.num { font-variant-numeric: tabular-nums; }
   background: var(--bg);
   color: var(--fg);
 }
-.grid-form input:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+.grid-form input:focus, .grid-form select:focus { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
 .grid-form .check { display: flex; align-items: center; gap: 8px; }
 .advanced summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 .advanced-grid { display: grid; gap: 12px; margin-top: 12px; }

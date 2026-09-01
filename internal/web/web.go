@@ -22,6 +22,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -44,20 +45,32 @@ type Server struct {
 	prefix     string // "/t/<token>"
 	controller bool
 	reports    *control.Reports
+	apiURL     string // advertised agent API URL (join commands)
+	caHash     string // controller CA fingerprint (join commands)
+	// Pending join commands, served exactly once by handleEnrollShow.
+	enrollMu   sync.Mutex
+	enrollPend map[string]enrollView
 	pages      map[string]*template.Template
 	partial    *template.Template
 	mux        *http.ServeMux
 }
 
-// New builds a local-mode Server with a fresh random token.
-func New(a *app.App) (*Server, error) { return newServer(a, false, nil) }
-
-// NewController builds a controller-mode Server fed by agent reports.
-func NewController(a *app.App, reports *control.Reports) (*Server, error) {
-	return newServer(a, true, reports)
+// ControllerOpts carries controller wiring the console needs to render
+// agent join commands.
+type ControllerOpts struct {
+	APIURL        string // e.g. "https://ctrl.example.com:8443"
+	CAFingerprint string // hex sha256 of the controller CA
 }
 
-func newServer(a *app.App, controller bool, reports *control.Reports) (*Server, error) {
+// New builds a local-mode Server with a fresh random token.
+func New(a *app.App) (*Server, error) { return newServer(a, false, nil, ControllerOpts{}) }
+
+// NewController builds a controller-mode Server fed by agent reports.
+func NewController(a *app.App, reports *control.Reports, opts ControllerOpts) (*Server, error) {
+	return newServer(a, true, reports, opts)
+}
+
+func newServer(a *app.App, controller bool, reports *control.Reports, opts ControllerOpts) (*Server, error) {
 	buf := make([]byte, 24)
 	if _, err := rand.Read(buf); err != nil {
 		return nil, fmt.Errorf("generate token: %w", err)
@@ -68,6 +81,9 @@ func newServer(a *app.App, controller bool, reports *control.Reports) (*Server, 
 		prefix:     "/t/" + hex.EncodeToString(buf),
 		controller: controller,
 		reports:    reports,
+		apiURL:     opts.APIURL,
+		caHash:     opts.CAFingerprint,
+		enrollPend: map[string]enrollView{},
 	}
 	if err := s.parseTemplates(); err != nil {
 		return nil, err
@@ -121,7 +137,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /static/", s.handleStatic)
 	if s.controller {
 		s.mux.HandleFunc("GET /{$}", s.handleDashboard)
+		s.mux.HandleFunc("POST /nodes", s.handleNodeAdd)
+		s.mux.HandleFunc("GET /enroll/{id}", s.handleEnrollShow)
 		s.mux.HandleFunc("GET /node/{node}", s.handleNode)
+		s.mux.HandleFunc("POST /node/{node}/token", s.handleNodeToken)
+		s.mux.HandleFunc("POST /node/{node}/peers", s.handlePeerQuickAdd)
 		s.mux.HandleFunc("POST /node/{node}/ifaces", s.handleIfaceCreate)
 		s.mux.HandleFunc("GET /node/{node}/iface/{name}", s.handleIface)
 		s.mux.HandleFunc("GET /node/{node}/iface/{name}/peers-table", s.handlePeersTable)
@@ -167,7 +187,7 @@ func (s *Server) parseTemplates() error {
 		return err
 	}
 	s.pages = map[string]*template.Template{}
-	pages := []string{"dashboard.html", "iface.html", "peerconf.html", "error.html", "node.html"}
+	pages := []string{"dashboard.html", "iface.html", "peerconf.html", "error.html", "node.html", "enroll.html"}
 	for _, page := range pages {
 		t, err := template.Must(base.Clone()).ParseFS(files, "templates/"+page, "templates/peers.html")
 		if err != nil {
@@ -322,6 +342,99 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}{false, cards})
 }
 
+// enrollTokenTTL is how long a minted enrollment token stays redeemable.
+const enrollTokenTTL = 24 * time.Hour
+
+// enrollView is a freshly minted join command, shown exactly once.
+type enrollView struct {
+	Node    string
+	Token   string
+	Command string
+	Expires time.Time
+}
+
+// handleNodeAdd is controller-only: the "Add node" form mints a one-time
+// enrollment token and redirects to a page showing the join command.
+func (s *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.badRequest(w, "bad form")
+		return
+	}
+	name := strings.TrimSpace(r.PostFormValue("name"))
+	if name == "" {
+		s.badRequest(w, "node name is required")
+		return
+	}
+	// Node names become URL paths and certificate CNs — keep them strict.
+	if !store.ValidNodeName(name) {
+		s.badRequest(w, "invalid node name (max 64 chars, starts with [a-zA-Z0-9], then [a-zA-Z0-9_.-])")
+		return
+	}
+	if err := s.app.Store.EnsureNodePending(name); err != nil {
+		s.serverError(w, err)
+		return
+	}
+	s.mintEnrollToken(w, r, name)
+}
+
+// handleNodeToken re-mints an existing node's enrollment token: the old
+// outstanding token (if any) is revoked, so each node has at most one live
+// token. Re-minting for an enrolled node is the re-enrollment path — the
+// new certificate supersedes the old one via the fingerprint check.
+func (s *Server) handleNodeToken(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+	if _, err := s.app.Store.GetNode(node); err != nil {
+		s.notFoundOrError(w, err)
+		return
+	}
+	if err := s.app.Store.DeleteEnrollTokens(node); err != nil {
+		s.serverError(w, err)
+		return
+	}
+	s.mintEnrollToken(w, r, node)
+}
+
+// mintEnrollToken creates a one-time token for node and redirects to the
+// page that shows the join command exactly once.
+func (s *Server) mintEnrollToken(w http.ResponseWriter, r *http.Request, node string) {
+	token, err := s.app.Store.CreateEnrollToken(node, enrollTokenTTL)
+	if err != nil {
+		s.serverError(w, err)
+		return
+	}
+	id := make([]byte, 8)
+	if _, err := rand.Read(id); err != nil {
+		s.serverError(w, err)
+		return
+	}
+	view := enrollView{
+		Node:    node,
+		Token:   token,
+		Command: fmt.Sprintf("sudo wgmgt agent --server %s --token %s --ca-hash sha256:%s", s.apiURL, token, s.caHash),
+		Expires: time.Now().Add(enrollTokenTTL),
+	}
+	key := hex.EncodeToString(id)
+	s.enrollMu.Lock()
+	s.enrollPend[key] = view
+	s.enrollMu.Unlock()
+	http.Redirect(w, r, s.url("enroll", key), http.StatusSeeOther)
+}
+
+// handleEnrollShow serves the join command once; a second GET 404s (the
+// token is one-time anyway, but the command contains it verbatim).
+func (s *Server) handleEnrollShow(w http.ResponseWriter, r *http.Request) {
+	key := r.PathValue("id")
+	s.enrollMu.Lock()
+	view, ok := s.enrollPend[key]
+	delete(s.enrollPend, key)
+	s.enrollMu.Unlock()
+	if !ok {
+		s.render(w, http.StatusNotFound, "error.html", errorView{Code: 404, Message: "join command already viewed or expired — mint a new token"})
+		return
+	}
+	s.render(w, http.StatusOK, "enroll.html", view)
+}
+
 func (s *Server) handleNode(w http.ResponseWriter, r *http.Request) {
 	node := r.PathValue("node")
 	ifaces, err := s.app.Store.ListInterfaces(node)
@@ -340,10 +453,39 @@ func (s *Server) handleNode(w http.ResponseWriter, r *http.Request) {
 		up, _ := s.liveStatus(&ifc)
 		list = append(list, nodeIface{Interface: ifc, ReportedUp: up, PeerCount: len(peers)})
 	}
+	// Enrollment state for the token section: enrolled (fingerprint set) or
+	// still pending, plus the outstanding token's expiry if one exists.
+	enrolled := false
+	var tokenExpiry string
+	if n, err := s.app.Store.GetNode(node); err == nil {
+		enrolled = n.Fingerprint != ""
+	}
+	if toks, err := s.app.Store.ListEnrollTokens(node); err == nil && len(toks) > 0 {
+		tokenExpiry = toks[0].ExpiresAt
+	}
 	s.render(w, http.StatusOK, "node.html", struct {
-		Node       string
-		Interfaces []nodeIface
-	}{node, list})
+		Node        string
+		Interfaces  []nodeIface
+		Enrolled    bool
+		TokenExpiry string
+	}{node, list, enrolled, tokenExpiry})
+}
+
+// handlePeerQuickAdd is controller-only: the node page's quick-add form.
+// It resolves the chosen interface from the form and forwards to the
+// regular peer-add handler.
+func (s *Server) handlePeerQuickAdd(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.badRequest(w, "bad form")
+		return
+	}
+	iface := strings.TrimSpace(r.PostFormValue("iface"))
+	if iface == "" {
+		s.badRequest(w, "choose an interface")
+		return
+	}
+	r.SetPathValue("name", iface)
+	s.handlePeerAdd(w, r)
 }
 
 // handleIfaceCreate is controller-only: the wizard form for adding an

@@ -34,6 +34,8 @@ var serverFlags struct {
 
 var enrollFlags struct{ out string }
 
+var tokenFlags struct{ ttl time.Duration }
+
 var serverCmd = &cobra.Command{
 	Use:   "server",
 	Short: "Run the controller (agent API + web console)",
@@ -59,6 +61,12 @@ var serverCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("server certificates: %w", err)
 		}
+		// The API signs enrollment certificates; EnsureServerCerts only
+		// returns the TLS pair, so re-read the CA.
+		ca, err := certs.LoadOrNewCA(dir)
+		if err != nil {
+			return err
+		}
 
 		st, err := store.Open(filepath.Join(dir, "db.sqlite"))
 		if err != nil {
@@ -67,14 +75,20 @@ var serverCmd = &cobra.Command{
 		defer st.Close()
 
 		reports := control.NewReports()
-		api := control.NewAPI(st, reports, serverFlags.pollHold)
+		api, err := control.NewAPI(st, ca, reports, serverFlags.pollHold)
+		if err != nil {
+			return err
+		}
 		// Every store mutation wakes the node's hanging long-polls, so web
 		// console changes reach agents in milliseconds.
 		st.OnChange = api.Notify
 		apiSrv := api.Server(serverFlags.api, srvCert, caPool)
 
 		webApp := &app.App{Store: st, ConfDir: dir}
-		webSrv, err := web.NewController(webApp, reports)
+		webSrv, err := web.NewController(webApp, reports, web.ControllerOpts{
+			APIURL:        "https://" + apiAdvertise(serverFlags.api),
+			CAFingerprint: ca.CAFingerprint(),
+		})
 		if err != nil {
 			return err
 		}
@@ -179,6 +193,42 @@ var serverEnrollCmd = &cobra.Command{
 	},
 }
 
+var serverTokenCmd = &cobra.Command{
+	Use:   "token <node-name>",
+	Short: "Mint a one-time enrollment token and print the agent join command",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		name := args[0]
+		if !store.ValidNodeName(name) {
+			return fmt.Errorf("invalid node name %q: must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$ (it becomes a URL path and a certificate CN)", name)
+		}
+		dir := serverFlags.dir
+		ca, err := certs.LoadOrNewCA(dir)
+		if err != nil {
+			return err
+		}
+		st, err := store.Open(filepath.Join(dir, "db.sqlite"))
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		if err := st.EnsureNodePending(name); err != nil {
+			return err
+		}
+		token, err := st.CreateEnrollToken(name, tokenFlags.ttl)
+		if err != nil {
+			return err
+		}
+		advertise := "https://" + apiAdvertise(serverFlags.api)
+		out := cmd.OutOrStdout()
+		fmt.Fprintf(out, "One-time enrollment token for %q (valid %s, single use):\n  %s\n", name, tokenFlags.ttl, token)
+		fmt.Fprintf(out, "\nOn the node run:\n")
+		fmt.Fprintf(out, "  sudo wgmgt agent --server %s --token %s --ca-hash sha256:%s\n",
+			advertise, token, ca.CAFingerprint())
+		return nil
+	},
+}
+
 func init() {
 	serverCmd.PersistentFlags().StringVar(&serverFlags.dir, "dir", defaultServerDir, "controller state directory (certs + database)")
 	serverCmd.PersistentFlags().StringVar(&serverFlags.api, "api", ":8443", "mTLS listen address for agents")
@@ -186,7 +236,9 @@ func init() {
 	serverCmd.PersistentFlags().BoolVar(&serverFlags.webGlobal, "web-global", false, "web console listens on all interfaces (default loopback only)")
 	serverCmd.PersistentFlags().DurationVar(&serverFlags.pollHold, "poll-hold", 25*time.Second, "max time an agent poll is held waiting for config changes (0 = answer immediately; must stay below the agent's 60s response timeout)")
 	serverEnrollCmd.Flags().StringVar(&enrollFlags.out, "out", ".", "directory to write the agent certificate files into")
+	serverTokenCmd.Flags().DurationVar(&tokenFlags.ttl, "ttl", 24*time.Hour, "enrollment token validity window")
 	serverCmd.AddCommand(serverEnrollCmd)
+	serverCmd.AddCommand(serverTokenCmd)
 	rootCmd.AddCommand(serverCmd)
 }
 
@@ -196,4 +248,22 @@ func displayAddr(addr string) string {
 		return "localhost" + addr
 	}
 	return addr
+}
+
+// apiAdvertise renders --api as the host agents dial: a wildcard bind maps
+// to the machine's hostname (covered by the server certificate SANs), a
+// specific bind address is used verbatim.
+func apiAdvertise(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		if h, _ := os.Hostname(); h != "" {
+			host = h
+		} else {
+			host = "localhost"
+		}
+	}
+	return net.JoinHostPort(host, port)
 }

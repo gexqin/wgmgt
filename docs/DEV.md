@@ -83,6 +83,33 @@ wgmgt/
   决定——签名不变只热更 peer(不断线);变了就重建设备。这也是全隧道
   开关能生效的机制。
 
+## Token 引导注册(2026-09-01 补)
+
+- **`enroll_tokens` 表**:只存 token 的 sha256;三个时间列(created/
+  expires/used)一律 Go 侧写 RFC3339 UTC——库里其它表的
+  `datetime('now')` 默认值与 RFC3339 字符串**字典序不兼容**。兑换用
+  单条 `UPDATE ... WHERE used_at = '' AND expires_at > now` +
+  RowsAffected 判定(单连接 SQLite 即原子);未知/过期/已用统一
+  `ErrNotFound`,对外不可区分。过期行在创建新 token 时懒清理。
+- **TLS 层 `VerifyClientCertIfGiven`**(而非 RequireAndVerify):
+  引导请求(`/api/enroll`)没有客户端证书,认证靠 token;`handlePoll`
+  自己在 handler 层拒绝无证书请求(401)。服务端出示链**尾部追加
+  根 CA 的 DER**——否则 agent 的 `--ca-hash` pin 无从比对。
+- **烧毁顺序**(fail-closed):先做廉价的公钥形状校验(坏请求不浪费
+  token)→ 烧毁 token → 签证书。签发失败时 token 已烧,节点须重铸。
+- **`EnsureNodePending` vs `EnsureNode`**:预注册 pending 节点必须用
+  前者(`ON CONFLICT DO NOTHING`);后者 upsert fingerprint,会把已
+  注册节点的指纹抹掉、破坏吊销。pending 节点 fingerprint 为空时
+  poll 放行任意本 CA 签的同 CN 证书——可接受,因为只有控制端 CA
+  能签发。
+- **agent 侧**(internal/agent/enroll.go):本地生成 P-256 密钥,只发
+  公钥(PKIX PEM);`InsecureSkipVerify` + `VerifyPeerCertificate`
+  回调实现 pin(链中任一证书哈希 == pin,且叶子对该根做完整 Verify
+  含主机名校验)。该 client 用**硬超时 30s**——注册没有长轮询,别抄
+  poll client 的无超时模式。响应材料二次校验(pair 一致 + 证书由
+  返回的 CA 签发),落盘 conf-dir(0700,key 0600);重启时
+  `LoadMaterial` 命中即跳过注册。
+
 ## 全隧道与自锁回退(2026-08-27 补)
 
 - **策略路由**(wgctl):AllowedIPs 含 0/0 或 ::/0 时,wg-quick 同款
@@ -129,6 +156,9 @@ node 起 agent(--verify-timeout 12s)→ 正常接口 v1 ✓
   peers 片段单独解析供 htmx 轮询端点复用。
 - **htmx 只做一件事**:peer 表每 5 秒轮询刷新;操作(up/down/表单)
   都是普通 POST + 303,无 JS 也能用。
+- **一次性展示页**(控制端 Add node):join 命令存进程内 map(随机
+  id → 命令),GET `/enroll/{id}` 弹出即删,二次访问 404。token 本身
+  一次性,页面同样一次性只是纵深防御。
 
 ## 关键实现事实
 

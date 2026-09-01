@@ -2,8 +2,8 @@
 {{if .Controller}}
 <h1>Nodes</h1>
 {{if not .Nodes}}
-<p class="empty">No agents enrolled yet. Run <code>sudo wgmgt server enroll &lt;name&gt;</code>
-on the controller, then start <code>wgmgt agent</code> on the node with the issued files.</p>
+<p class="empty">No agents enrolled yet. Add a node below to mint a one-time
+enrollment token, then run the printed command on the node.</p>
 {{else}}
 <div class="cards">
 {{range .Nodes}}
@@ -22,6 +22,13 @@ on the controller, then start <code>wgmgt agent</code> on the node with the issu
 {{end}}
 </div>
 {{end}}
+<section>
+<h2>Add node</h2>
+<form class="grid-form" method="post" action="{{u "nodes"}}">
+  <label>Name <input name="name" required placeholder="router1"></label>
+  <div><button class="btn primary" type="submit">Create enrollment token</button></div>
+</form>
+</section>
 {{else}}
 <h1>Interfaces</h1>
 {{if not .Cards}}

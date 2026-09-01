@@ -7,7 +7,7 @@
 {{range .Interfaces}}
   <div class="card">
     <div class="card-head">
-      <a class="card-title" href="{{iu .}}">{{.Name}}</a>
+      <a class="card-title" href="{{iu .Interface}}">{{.Name}}</a>
       <span class="state {{if .ReportedUp}}up{{else}}down{{end}}">{{if .ReportedUp}}● UP{{else}}{{if .Enabled}}○ PENDING{{else}}○ DISABLED{{end}}{{end}}</span>
     </div>
     <dl class="card-meta">
@@ -19,6 +19,37 @@
 {{end}}
 </div>
 {{end}}
+
+<section>
+<h2>Quick add peer</h2>
+{{if not .Interfaces}}
+<p class="empty">Create an interface first.</p>
+{{else}}
+<form class="grid-form" method="post" action="{{u "node" .Node "peers"}}">
+  <label>Interface
+    <select name="iface" required>
+      {{range .Interfaces}}<option value="{{.Name}}">{{.Name}} ({{.Address}})</option>{{end}}
+    </select>
+  </label>
+  <label>Peer name <input name="name" required placeholder="laptop"></label>
+  <label>Allowed IPs <input name="allowed_ips" placeholder="auto"></label>
+  <div><button class="btn primary" type="submit">Add peer</button></div>
+</form>
+{{end}}
+</section>
+
+<section>
+<h2>Enrollment</h2>
+<p class="muted">{{if .Enrolled}}Enrolled — certificate active.{{else}}Pending — no certificate enrolled yet.{{end}}
+{{if .TokenExpiry}} A one-time token is outstanding (expires {{.TokenExpiry}}).
+{{else}} No outstanding token.{{end}}</p>
+<form method="post" action="{{u "node" .Node "token"}}">
+  <button class="btn" type="submit">Mint new enrollment token</button>
+</form>
+<p class="muted">Minting revokes any outstanding token for this node and shows
+a fresh join command once. For an enrolled node this is the re-enrollment
+path: the new certificate supersedes the old one.</p>
+</section>
 
 <section>
 <h2>Add interface</h2>
