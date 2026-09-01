@@ -188,7 +188,7 @@ var serverEnrollCmd = &cobra.Command{
 		fmt.Fprintf(out, "Agent certificate issued for %q (fingerprint %s…)\n", name, fp[:16])
 		fmt.Fprintf(out, "  %s\n  %s\n  %s\n", certPath, keyPath, caPath)
 		fmt.Fprintf(out, "\nCopy these files to the node, then run there:\n")
-		fmt.Fprintf(out, "  sudo wgmgt agent --server https://<controller>:8443 --ca ca.pem --cert %[1]s.pem --key %[1]s.key\n", name)
+		fmt.Fprintf(out, "  sudo wgmgt agent --server https://%[1]s --ca ca.pem --cert %[2]s.pem --key %[2]s.key\n", apiAdvertise(serverFlags.api), name)
 		return nil
 	},
 }
