@@ -334,6 +334,48 @@ func TestNodeTokenRemintRevokesOld(t *testing.T) {
 	}
 }
 
+func TestNodeDeleteAndReuse(t *testing.T) {
+	ts, prefix, st := newControllerServer(t)
+	if err := st.EnsureNodePending("router1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.CreateEnrollToken("router1", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/node/router1/rm", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("node delete = %d, want 303", resp.StatusCode)
+	}
+	if loc := resp.Header.Get("Location"); loc != prefix+"/" {
+		t.Errorf("redirect = %q, want dashboard", loc)
+	}
+
+	if _, err := st.GetNode("router1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetNode = %v, want ErrNotFound", err)
+	}
+	if toks, err := st.ListEnrollTokens("router1"); err != nil || len(toks) != 0 {
+		t.Errorf("tokens after delete = %v, %v", toks, err)
+	}
+
+	// The name is free again: re-creating mints a fresh join command.
+	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/nodes", url.Values{"name": {"router1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("node re-add = %d, want 303", resp.StatusCode)
+	}
+	if code, body := get(t, ts, resp.Header.Get("Location")); code != http.StatusOK || !strings.Contains(body, "--token") {
+		t.Fatalf("join page after re-add = %d\n%s", code, body)
+	}
+}
+
 func TestQuickAddPeerOnNodePage(t *testing.T) {
 	ts, prefix, st := newControllerServer(t)
 	st.EnsureNode("n1", "fp")

@@ -1,5 +1,5 @@
 {{define "content"}}
-<h1>Join node <span class="muted">— {{.Node}}</span></h1>
+<h1>Client Join <span class="muted">— {{.Node}}</span></h1>
 <p class="muted">One-time enrollment token, valid until {{.Expires.Format "2006-01-02 15:04" }} (single use).
 Run this on the node:</p>
 <div class="conf-wrap">
@@ -11,11 +11,37 @@ controller CA is pinned via <code>--ca-hash</code> for the first contact. Once t
 has enrolled, this page is gone — mint a new token to redo it.</p>
 <p><a href="{{u}}">← back to dashboard</a></p>
 <script>
+// navigator.clipboard is undefined outside a secure context (the console is
+// plain HTTP behind --web-global), so fall back to the legacy execCommand
+// path there.
+function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise(function (resolve, reject) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try {
+      document.execCommand('copy') ? resolve() : reject(new Error('copy command refused'));
+    } catch (err) {
+      reject(err);
+    } finally {
+      ta.remove();
+    }
+  });
+}
 document.getElementById('copy-btn').addEventListener('click', function () {
   var btn = this;
-  navigator.clipboard.writeText(document.getElementById('join-cmd').textContent).then(function () {
+  copyText(document.getElementById('join-cmd').textContent).then(function () {
     btn.textContent = 'Copied';
-    setTimeout(function () { btn.textContent = 'Copy'; }, 1500);
+  }, function () {
+    btn.textContent = 'Copy failed — select manually';
+  }).then(function () {
+    setTimeout(function () { btn.textContent = 'Copy'; }, 2000);
   });
 });
 </script>

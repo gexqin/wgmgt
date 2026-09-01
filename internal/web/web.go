@@ -141,6 +141,7 @@ func (s *Server) routes() {
 		s.mux.HandleFunc("GET /enroll/{id}", s.handleEnrollShow)
 		s.mux.HandleFunc("GET /node/{node}", s.handleNode)
 		s.mux.HandleFunc("POST /node/{node}/token", s.handleNodeToken)
+		s.mux.HandleFunc("POST /node/{node}/rm", s.handleNodeRm)
 		s.mux.HandleFunc("POST /node/{node}/peers", s.handlePeerQuickAdd)
 		s.mux.HandleFunc("POST /node/{node}/ifaces", s.handleIfaceCreate)
 		s.mux.HandleFunc("GET /node/{node}/iface/{name}", s.handleIface)
@@ -392,6 +393,19 @@ func (s *Server) handleNodeToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mintEnrollToken(w, r, node)
+}
+
+// handleNodeRm is controller-only: deletes the node and everything it owns
+// (interfaces, peers, tokens). An enrolled agent fails auth on its next
+// poll and its dead-man switch rolls WireGuard back — no agent-side action
+// needed.
+func (s *Server) handleNodeRm(w http.ResponseWriter, r *http.Request) {
+	node := r.PathValue("node")
+	if err := s.app.Store.DeleteNode(node); err != nil {
+		s.serverError(w, err)
+		return
+	}
+	http.Redirect(w, r, s.url(), http.StatusSeeOther)
 }
 
 // mintEnrollToken creates a one-time token for node and redirects to the

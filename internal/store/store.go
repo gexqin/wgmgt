@@ -389,6 +389,28 @@ func (s *Store) GetNode(name string) (*Node, error) {
 	return &n, err
 }
 
+// DeleteNode removes a node and everything it owns: interfaces (peers go
+// with them via cascade), enrollment tokens, and the registry row. An
+// enrolled agent discovers this on its next poll (auth fails, node unknown)
+// and rolls itself back via its verify-timeout dead-man switch.
+func (s *Store) DeleteNode(name string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, q := range []string{
+		"DELETE FROM interfaces WHERE node = ?", // peers cascade
+		"DELETE FROM enroll_tokens WHERE node = ?",
+		"DELETE FROM nodes WHERE name = ?",
+	} {
+		if _, err := tx.Exec(q, name); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // ValidIfaceName reports whether name is a safe Linux interface name.
 // It doubles as a path-safety guard: interface names become conf file
 // names on agents, so this must stay strict.

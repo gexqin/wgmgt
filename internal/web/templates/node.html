@@ -61,4 +61,15 @@ path: the new certificate supersedes the old one.</p>
   <div><button class="btn primary" type="submit">Create interface</button></div>
 </form>
 </section>
+
+<section>
+<h2>Danger zone</h2>
+<form method="post" action="{{u "node" .Node "rm"}}"
+  onsubmit="return confirm('Delete node {{.Node}} with all its interfaces, peers and tokens?')">
+  <button class="btn danger" type="submit">Delete node</button>
+</form>
+<p class="muted">Removes the node's interfaces, peers and enrollment tokens; the
+name can be reused for a fresh node. An enrolled agent notices on its next
+poll and rolls its WireGuard config back by itself.</p>
+</section>
 {{end}}

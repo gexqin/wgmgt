@@ -145,6 +145,50 @@ func TestPeerMutationBumpsVersion(t *testing.T) {
 	}
 }
 
+func TestDeleteNodeCascadesAndAllowsReuse(t *testing.T) {
+	s := open(t)
+	if err := s.EnsureNodePending("n1"); err != nil {
+		t.Fatal(err)
+	}
+	mustCreate(t, s, "n1", "wg0")
+	if err := s.AddPeer(&Peer{Node: "n1", Interface: "wg0", Name: "laptop", PublicKey: "pub1", AllowedIPs: "10.0.0.2/32"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CreateEnrollToken("n1", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnsureNode("n2", "fp"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.DeleteNode("n1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetNode("n1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetNode = %v, want ErrNotFound", err)
+	}
+	if ifcs, err := s.ListInterfaces("n1"); err != nil || len(ifcs) != 0 {
+		t.Errorf("interfaces after delete = %v, %v", ifcs, err)
+	}
+	if peers, err := s.ListPeers("n1", "wg0"); err != nil || len(peers) != 0 {
+		t.Errorf("peers after delete = %v, %v", peers, err)
+	}
+	if toks, err := s.ListEnrollTokens("n1"); err != nil || len(toks) != 0 {
+		t.Errorf("tokens after delete = %v, %v", toks, err)
+	}
+	if nodes, _ := s.ListNodes(); len(nodes) != 1 || nodes[0].Name != "n2" {
+		t.Errorf("siblings must survive, nodes = %v", nodes)
+	}
+
+	// The name is free again: a fresh node can take it.
+	if err := s.EnsureNodePending("n1"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.GetNode("n1"); err != nil || n.Fingerprint != "" {
+		t.Errorf("recreated node = %+v, %v", n, err)
+	}
+}
+
 func TestNodeRegistry(t *testing.T) {
 	s := open(t)
 	if err := s.EnsureNode("n1", "AA:BB"); err != nil {
