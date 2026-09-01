@@ -35,7 +35,9 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w \
 ## Quick start
 
 ```sh
-sudo wgmgt init                     # wizard: create an interface
+sudo wgmgt init                     # wizard: create an interface, then the
+                                    # controller CA + server certificate
+                                    # (SAN DNS names and IPs asked separately)
 sudo wgmgt peer add --name laptop   # generates keys, prints client conf
 sudo wgmgt up                       # native netlink bring-up
 sudo wgmgt status                   # handshakes and traffic
@@ -43,7 +45,9 @@ sudo wgmgt delete                   # tear down + remove an interface
 
 sudo wgmgt web                        # embedded web UI (token-protected)
 sudo wgmgt server                     # controller: mTLS agent API + web console
-sudo wgmgt server --web 9090 --web-global   # custom port, listen on all interfaces
+sudo wgmgt server --api 203.0.113.10:8443 --web 9090 --web-global \
+                                      # bind --api to a SAN name/IP from init
+                                      # so agents dialing it verify cleanly
 
 # Adding a client — one-time enrollment token (or use the console's
 # "Add client" form, which prints the same join command once):
@@ -70,9 +74,13 @@ them in milliseconds; a store-level change hook wakes held polls), apply
 it via netlink, and report live status with each poll cycle; the
 controller web console manages clients, interfaces, peers, and enrollment
 tokens across the fleet. A dead-man switch rolls agents back out of
-configurations that lock the client away from the controller. Re-running
-`wgmgt init` on an existing setup offers a full reset (database and
-controller CA wiped, everything regenerates). Verified
+configurations that lock the client away from the controller. `wgmgt init`
+ends with the controller PKI step: it generates (or keeps) the CA and
+issues the server certificate with the prompted SANs — DNS names and IPs
+asked separately — so agents can dial by hostname or public IP. Re-running
+`wgmgt init` on an existing setup offers a full reset: it stops running
+wgmgt processes, wipes the state directory (databases and controller CA
+included), and everything regenerates. Verified
 end-to-end with two agents in separate network namespaces building a
 tunnel entirely through the console. See the
 [roadmap](docs/PLAN.md) for what's next (router packages, releases).

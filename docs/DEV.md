@@ -47,6 +47,8 @@ wgmgt/
 │   ├── agent/          # agent:pull 循环、配置收敛(netlink)、状态上报
 │   ├── app/            # CLI 与 Web 共享的编排:SyncConf、NextFreeIP
 │   ├── certs/          # 内置 PKI:CA / 服务端证书 / agent 客户端证书
+│   │                   #(`IssueServerCert` = init 交互路径,SAN 覆盖则复用;
+│   │                   #  `EnsureServerCerts` = server 启动路径,缺啥补啥)
 │   ├── cli/            # cobra 命令树:init/up/down/peer/status/web/server/agent/doctor/version
 │   ├── confgen/        # wg-quick 兼容 conf 渲染(服务端 + 客户端)
 │   ├── control/        # 控制端:mTLS poll API、配置下发、状态上报缓存
@@ -95,6 +97,12 @@ wgmgt/
   引导请求(`/api/enroll`)没有客户端证书,认证靠 token;`handlePoll`
   自己在 handler 层拒绝无证书请求(401)。服务端出示链**尾部追加
   根 CA 的 DER**——否则 agent 的 `--ca-hash` pin 无从比对。
+- **服务器证书 SAN 来自 init 交互**(`IssueServerCert`):DNS 与 IP 分开
+  询问,已有 CA 保留(重生 CA = 全量重置),证书 SAN 已覆盖则复用、
+  否则重签。教训:通配 `--api` 绑定生成的 SAN 只有主机名,agent 按公网
+  IP 拨号时域名校验必挂,且 `server.pem` 存在即被复用、不会自动带上
+  新 SAN——所以 SAN 的填写前置到了 init,起 server 时 `--api` 绑定到
+  所填名字之一即可。
 - **烧毁顺序**(fail-closed):先做廉价的公钥形状校验(坏请求不浪费
   token)→ 烧毁 token → 签证书。签发失败时 token 已烧,客户端须重铸。
 - **`EnsureClientPending` vs `EnsureClient`**:预注册 pending 客户端必须用

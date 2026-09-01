@@ -178,11 +178,12 @@ WGMGT web UI: http://127.0.0.1:8080/t/913fc4cf45d2…/
 
 ```
 # 1. 控制端(一次)
-sudo wgmgt server                       # 首次启动自动生成 CA 与服务端证书
-                                        # API :8443(mTLS),控制台 127.0.0.1:8080
-# 端口与监听范围均可指定:
-sudo wgmgt server --api :9443 --web 9090 --web-global
-                                        # agent API 换 9443,控制台 9090 且监听全网卡
+sudo wgmgt init                         # 接口向导末尾设置 CA 与服务器证书,
+                                        # SAN 的 DNS 与 IP 分开询问(如公网 IP)
+sudo wgmgt server --api <所填IP或域名>:8443 --web 9090 --web-global
+                                        # --api 绑定到所填名字之一,SAN 才匹配;
+                                        # 跳过 init 的 CA 步骤时,server 首次
+                                        # 启动仍会自动生成(SAN 为主机名)
 
 # 2. 添加客户端:生成一次性注册 token(每个客户端一次)
 sudo wgmgt server token router1         # 或控制台「Add client」表单
@@ -216,7 +217,7 @@ sudo wgmgt agent --server https://控制端:8443 \
 
 | 命令 | Flag | 默认 | 说明 |
 |------|------|------|------|
-| `server` | `--api` | `:8443` | agent API 监听地址(mTLS) |
+| `server` | `--api` | `:8443` | agent API 监听地址(mTLS);**绑定到 init 所填 SAN 名之一**,agent 按该地址拨号才能通过证书校验 |
 | | `--web` | `8080` | 控制台端口 |
 | | `--web-global` | 关 | 控制台监听全网卡(默认仅 127.0.0.1;明文 HTTP 有警告) |
 | | `--poll-hold` | `25s` | 长轮询挂起上限(0 = 立即应答;须 < agent 的 60s 响应超时) |
@@ -256,7 +257,9 @@ fwmark 标记隧道自身流量、默认路由进独立路由表(51820)、
 控制台(`wgmgt server` 打印的 token URL):
 
 - **客户端总览**:在线状态(上报新鲜度)、接口数、最近上报时间、
-  隔离徽章
+  隔离徽章;每张卡片自带 **Delete client** 按钮(带确认框,删除该
+  客户端的接口/peer/token,名字可复用;已注册的 agent 下次轮询
+  auth 失败,死人开关自动回滚)
 - **添加客户端**:表单填名字 → 生成一次性 token,展示完整 join 命令
   (仅显示一次;刷新即 404,重铸即可)
 - **客户端详情页**:接口卡片、**Quick add peer**(选接口 + 名字,一步加
