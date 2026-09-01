@@ -144,9 +144,9 @@ var initCmd = &cobra.Command{
 // setupControllerCA is init's controller PKI step: the CA (kept when it
 // already exists — regenerating invalidates every enrolled agent and is
 // the full reset's job) and the server certificate with explicit SANs,
-// DNS names and IPs asked separately so agents can dial by either. With
-// no flags, interactive terminals get the prompts; non-interactive runs
-// skip the step unless --san-dns/--san-ip is given.
+// DNS names and IPs asked separately so agents can dial by either. Every
+// interactive init asks for both directly; non-interactive runs skip the
+// step unless --san-dns/--san-ip is given.
 func setupControllerCA(cmd *cobra.Command) error {
 	dnsNames := splitList(initFlags.sanDNS)
 	ips := splitList(initFlags.sanIP)
@@ -156,9 +156,6 @@ func setupControllerCA(cmd *cobra.Command) error {
 		}
 		out := cmd.OutOrStdout()
 		fmt.Fprintf(out, "\nController setup — CA and server certificate for `wgmgt server`.\n")
-		if !confirm("Set up now?", false) {
-			return nil
-		}
 		defDNS, _ := os.Hostname()
 		dnsNames = splitList(prompt("SAN DNS names (comma-separated)", defDNS))
 		ips = splitList(prompt("SAN IP addresses (comma-separated)", ""))
