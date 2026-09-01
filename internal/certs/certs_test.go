@@ -8,8 +8,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -230,4 +232,49 @@ func parse(t *testing.T, pemBytes []byte) *x509.Certificate {
 		t.Fatal(err)
 	}
 	return cert
+}
+
+func TestIssueServerCert(t *testing.T) {
+	dir := t.TempDir()
+	leaf := func() *x509.Certificate {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(dir, "server.pem"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return parse(t, b)
+	}
+
+	kept, err := IssueServerCert(dir, []string{"ctrl.example"}, []string{"203.0.113.10"})
+	if err != nil || kept {
+		t.Fatalf("first issue: kept = %v, err = %v; want false, nil", kept, err)
+	}
+	c := leaf()
+	if !slices.Contains(c.DNSNames, "ctrl.example") || !slices.Contains(c.DNSNames, "localhost") {
+		t.Errorf("DNS SANs = %v; want ctrl.example and localhost", c.DNSNames)
+	}
+	if !slices.ContainsFunc(c.IPAddresses, func(ip net.IP) bool { return ip.Equal(net.ParseIP("203.0.113.10")) }) {
+		t.Errorf("IP SANs = %v; want 203.0.113.10", c.IPAddresses)
+	}
+
+	// Same request again: the existing certificate already covers it.
+	if kept, err := IssueServerCert(dir, []string{"ctrl.example"}, []string{"203.0.113.10"}); err != nil || !kept {
+		t.Fatalf("reissue same SANs: kept = %v, err = %v; want true, nil", kept, err)
+	}
+	// A subset is also covered.
+	if kept, err := IssueServerCert(dir, nil, []string{"203.0.113.10"}); err != nil || !kept {
+		t.Fatalf("reissue subset: kept = %v, err = %v; want true, nil", kept, err)
+	}
+	// A new SAN forces a re-issue that includes it.
+	if kept, err := IssueServerCert(dir, []string{"ctrl.example"}, []string{"198.51.100.7"}); err != nil || kept {
+		t.Fatalf("reissue new IP: kept = %v, err = %v; want false, nil", kept, err)
+	}
+	c = leaf()
+	if !slices.ContainsFunc(c.IPAddresses, func(ip net.IP) bool { return ip.Equal(net.ParseIP("198.51.100.7")) }) {
+		t.Errorf("IP SANs after reissue = %v; want 198.51.100.7", c.IPAddresses)
+	}
+	// Garbage is rejected.
+	if _, err := IssueServerCert(dir, nil, []string{"not-an-ip"}); err == nil {
+		t.Error("invalid IP accepted")
+	}
 }

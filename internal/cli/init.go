@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
+	"github.com/gexqin/wgmgt/internal/certs"
 	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/wgctl"
 	"github.com/gexqin/wgmgt/internal/wgkern"
@@ -25,6 +26,8 @@ var initFlags struct {
 	port    int
 	mtu     int
 	dns     string
+	sanDNS  string
+	sanIP   string
 }
 
 var initCmd = &cobra.Command{
@@ -133,8 +136,79 @@ var initCmd = &cobra.Command{
 		fmt.Fprintf(out, "  Public key:  %s\n", key.PublicKey().String())
 		fmt.Fprintf(out, "  Conf file:   %s\n", confPath(name))
 		fmt.Fprintf(out, "\nNext: `wgmgt peer add %s` then `sudo wgmgt up %s`\n", name, name)
-		return nil
+
+		return setupControllerCA(cmd)
 	},
+}
+
+// setupControllerCA is init's controller PKI step: the CA (kept when it
+// already exists — regenerating invalidates every enrolled agent and is
+// the full reset's job) and the server certificate with explicit SANs,
+// DNS names and IPs asked separately so agents can dial by either. With
+// no flags, interactive terminals get the prompts; non-interactive runs
+// skip the step unless --san-dns/--san-ip is given.
+func setupControllerCA(cmd *cobra.Command) error {
+	dnsNames := splitList(initFlags.sanDNS)
+	ips := splitList(initFlags.sanIP)
+	if len(dnsNames) == 0 && len(ips) == 0 {
+		if !isTerminal(os.Stdin) {
+			return nil
+		}
+		out := cmd.OutOrStdout()
+		fmt.Fprintf(out, "\nController setup — CA and server certificate for `wgmgt server`.\n")
+		if !confirm("Set up now?", false) {
+			return nil
+		}
+		defDNS, _ := os.Hostname()
+		dnsNames = splitList(prompt("SAN DNS names (comma-separated)", defDNS))
+		ips = splitList(prompt("SAN IP addresses (comma-separated)", ""))
+	}
+
+	serverDir := filepath.Join(confDir, "server")
+	if err := os.MkdirAll(serverDir, 0o700); err != nil {
+		return err
+	}
+	caExisted := false
+	if _, err := os.Stat(filepath.Join(serverDir, "ca.pem")); err == nil {
+		caExisted = true
+	}
+	ca, err := certs.LoadOrNewCA(serverDir)
+	if err != nil {
+		return err
+	}
+	kept, err := certs.IssueServerCert(serverDir, dnsNames, ips)
+	if err != nil {
+		return err
+	}
+
+	out := cmd.OutOrStdout()
+	if caExisted {
+		fmt.Fprintf(out, "Controller CA: existing one kept — sha256:%s\n", ca.CAFingerprint())
+	} else {
+		fmt.Fprintf(out, "Controller CA: generated — sha256:%s\n", ca.CAFingerprint())
+	}
+	sans := strings.Join(append(append(dnsNames, ips...), "localhost", "127.0.0.1", "::1"), ", ")
+	if kept {
+		fmt.Fprintf(out, "Server certificate: existing one already covers %s — kept\n", sans)
+	} else {
+		fmt.Fprintf(out, "Server certificate: issued for %s\n", sans)
+	}
+	fmt.Fprintf(out, "Agents pin the CA fingerprint via --ca-hash (join commands print it).\n")
+	fmt.Fprintf(out, "Start the controller bound to one of the names above, e.g.:\n")
+	fmt.Fprintf(out, "  sudo wgmgt server --api <name-or-ip>:8443\n")
+	return nil
+}
+
+// splitList splits a comma-separated flag/prompt value, trimming spaces
+// and dropping empty fields.
+func splitList(s string) []string {
+	var out []string
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // offerReset is called from init when the chosen name is already managed
@@ -364,5 +438,7 @@ func init() {
 	initCmd.Flags().IntVar(&initFlags.port, "port", 51820, "UDP listen port (0 = ephemeral)")
 	initCmd.Flags().IntVar(&initFlags.mtu, "mtu", 0, "MTU (0 = kernel default)")
 	initCmd.Flags().StringVar(&initFlags.dns, "dns", "", "DNS advertised to peers")
+	initCmd.Flags().StringVar(&initFlags.sanDNS, "san-dns", "", "controller server certificate SAN DNS names, comma-separated (enables the CA setup step in non-interactive runs)")
+	initCmd.Flags().StringVar(&initFlags.sanIP, "san-ip", "", "controller server certificate SAN IP addresses, comma-separated")
 	rootCmd.AddCommand(initCmd)
 }

@@ -20,6 +20,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -232,6 +233,78 @@ func EnsureServerCerts(dir string, hosts []string) (tls.Certificate, *x509.CertP
 	pool := x509.NewCertPool()
 	pool.AddCert(ca.Cert)
 	return cert, pool, nil
+}
+
+// IssueServerCert is the interactive setup path (wgmgt init): it ensures
+// the CA in dir and issues the server certificate covering the given DNS
+// names and IP addresses (localhost is always included on top). An
+// existing certificate whose SANs already cover the request is reused
+// as-is; otherwise a fresh one is written. Returns whether the existing
+// certificate was kept. The server startup path is EnsureServerCerts,
+// which only fills in what is missing.
+func IssueServerCert(dir string, dnsNames, ips []string) (kept bool, err error) {
+	ca, err := LoadOrNewCA(dir)
+	if err != nil {
+		return false, err
+	}
+	certPath := filepath.Join(dir, "server.pem")
+	keyPath := filepath.Join(dir, "server.key")
+	if cert, err := tls.LoadX509KeyPair(certPath, keyPath); err == nil {
+		if leaf, err := x509.ParseCertificate(cert.Certificate[0]); err == nil && sanCovers(leaf, dnsNames, ips) {
+			return true, nil
+		}
+	}
+	hosts := make([]string, 0, len(dnsNames)+len(ips))
+	for _, d := range dnsNames {
+		if d = strings.TrimSpace(d); d != "" {
+			hosts = append(hosts, d)
+		}
+	}
+	for _, s := range ips {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if net.ParseIP(s) == nil {
+			return false, fmt.Errorf("invalid SAN IP %q", s)
+		}
+		hosts = append(hosts, s)
+	}
+	certPEM, keyPEM, err := ca.NewServerCert(hosts)
+	if err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+		return false, err
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// sanCovers reports whether leaf's SANs already include every requested
+// DNS name and IP; the always-added localhost entries need no check.
+func sanCovers(leaf *x509.Certificate, dnsNames, ips []string) bool {
+	haveDNS := make(map[string]bool, len(leaf.DNSNames))
+	for _, d := range leaf.DNSNames {
+		haveDNS[strings.ToLower(d)] = true
+	}
+	for _, d := range dnsNames {
+		if d = strings.TrimSpace(d); d != "" && !haveDNS[strings.ToLower(d)] {
+			return false
+		}
+	}
+	haveIP := make(map[string]bool, len(leaf.IPAddresses))
+	for _, ip := range leaf.IPAddresses {
+		haveIP[ip.String()] = true
+	}
+	for _, s := range ips {
+		if s = strings.TrimSpace(s); s != "" && !haveIP[s] {
+			return false
+		}
+	}
+	return true
 }
 
 // --- helpers ---
