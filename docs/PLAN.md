@@ -27,6 +27,7 @@
 | 14 | 许可证(2026-08-27 定) | **PolyForm Noncommercial 1.0.0**——允许非商业用途(个人/研究/教育/公益/政府),禁止商用。严格说是 source-available 而非 OSI 开源;后果:进不了 OpenWrt 官方源(M4 走侧载/自建源),梅林插件影响较小 |
 | 15 | Web UI 的 TLS(2026-08-27 定) | **不内置 HTTPS**:Web 控制台刻意只做明文 HTTP,默认仅回环;暴露到网络的场景由**反向代理**(nginx/caddy 等)或 SSH 隧道提供 TLS。不自带证书管理,避免与系统级反代/ACME 重复造轮子。注意区分:`server` 内置 CA 只服务 agent mTLS API(:8443),与 Web 控制台无关 |
 | 16 | agent 引导注册(2026-09-01 定,基线后增量) | **一次性 token 引导**:控制台「Add node」表单或 `wgmgt server token <name>` 铸 token(48 字符、单次使用、24h、库中只存哈希);节点上一条命令 `wgmgt agent --token … --ca-hash …` 自主完成。**agent 本地生成密钥对、只上传公钥**(私钥不出节点);首连信任用 `--ca-hash` 钉根证书指纹(kubeadm join 风格),服务端出示链带根证书;同端口 TLS `VerifyClientCertIfGiven`,poll 路由在 handler 层强制客户端证书。手动 `server enroll` 保留为兼容路径 |
+| 17 | 术语 node→client + init 全量重置(2026-09-01 定,基线后增量) | **"node" 全线更名 "client"**(表 `nodes`→`clients`、列 `node`→`client`、路由 `/node/`→`/client/`、API/模板/文档;旧库不迁移,报错提示重新 init)。`init` 检测到已有配置且确认重建时**全量重置**:**先杀本机运行中的 wgmgt 进程**(含 respawn 检测告警)、down 全部设备、**整目录删 `<conf-dir>/`**(conf + 本地库 + `server/` 下 CA/服务器证书与控制端库),全部重新生成(CA 指纹变化,agent 须重新注册)。控制台**删除 client 按钮外移**到 dashboard 卡片(带确认框) |
 
 ### 硬约束的推论
 

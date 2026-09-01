@@ -3,7 +3,7 @@
 // certificate authentication; agents connect outbound via HTTP long-polling
 // (a poll whose version is current is held until the config changes or the
 // hold expires, so changes reach agents in milliseconds); the agent
-// certificate CN is the node name.
+// certificate CN is the client name.
 package control
 
 import (
@@ -37,7 +37,7 @@ type AgentConfig struct {
 	Interfaces []AgentInterface `json:"interfaces"`
 }
 
-// AgentInterface is one interface of the node's desired state.
+// AgentInterface is one interface of the client's desired state.
 type AgentInterface struct {
 	Name       string       `json:"name"`
 	PrivateKey string       `json:"private_key"`
@@ -74,7 +74,7 @@ type PeerReport struct {
 	Endpoint  string    `json:"endpoint"`
 }
 
-// Reports caches the last status report per node for the web UI.
+// Reports caches the last status report per client for the web UI.
 type Reports struct {
 	mu     sync.RWMutex
 	latest map[string]ReportEntry
@@ -90,20 +90,20 @@ func NewReports() *Reports {
 	return &Reports{latest: map[string]ReportEntry{}}
 }
 
-func (rp *Reports) Update(node string, r StatusReport) {
+func (rp *Reports) Update(client string, r StatusReport) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
-	rp.latest[node] = ReportEntry{When: time.Now(), Report: r}
+	rp.latest[client] = ReportEntry{When: time.Now(), Report: r}
 }
 
-// Get returns the latest report of a node (zero When if none yet).
-func (rp *Reports) Get(node string) ReportEntry {
+// Get returns the latest report of a client (zero When if none yet).
+func (rp *Reports) Get(client string) ReportEntry {
 	rp.mu.RLock()
 	defer rp.mu.RUnlock()
-	return rp.latest[node]
+	return rp.latest[client]
 }
 
-// Notifier wakes hanging long-polls. Wake closes the node's current
+// Notifier wakes hanging long-polls. Wake closes the client's current
 // generation channel; WakeCh lazily recreates it for the next waiter. The
 // capture-order rule that makes this race-free: a handler must grab WakeCh
 // BEFORE reading the config version — a change after the capture closes the
@@ -115,25 +115,25 @@ type Notifier struct {
 
 func NewNotifier() *Notifier { return &Notifier{gen: map[string]chan struct{}{}} }
 
-// Wake releases all current waiters of a node.
-func (n *Notifier) Wake(node string) {
+// Wake releases all current waiters of a client.
+func (n *Notifier) Wake(client string) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if ch, ok := n.gen[node]; ok {
+	if ch, ok := n.gen[client]; ok {
 		close(ch)
-		delete(n.gen, node)
+		delete(n.gen, client)
 	}
 }
 
-// WakeCh returns the node's current generation channel (created on demand).
-func (n *Notifier) WakeCh(node string) <-chan struct{} {
+// WakeCh returns the client's current generation channel (created on demand).
+func (n *Notifier) WakeCh(client string) <-chan struct{} {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if ch, ok := n.gen[node]; ok {
+	if ch, ok := n.gen[client]; ok {
 		return ch
 	}
 	ch := make(chan struct{})
-	n.gen[node] = ch
+	n.gen[client] = ch
 	return ch
 }
 
@@ -146,9 +146,9 @@ type EnrollRequest struct {
 }
 
 // EnrollResponse is the bootstrap response: the issued certificate, the CA
-// the agent must use for subsequent mTLS polls, and the confirmed node name.
+// the agent must use for subsequent mTLS polls, and the confirmed client name.
 type EnrollResponse struct {
-	Node string `json:"node"`
+	Client string `json:"client"`
 	CA   string `json:"ca"`   // CA certificate PEM
 	Cert string `json:"cert"` // agent certificate PEM
 }
@@ -191,20 +191,20 @@ func NewAPI(st *store.Store, issuer CertIssuer, reports *Reports, hold time.Dura
 	return a, nil
 }
 
-// Notify wakes a node's hanging polls; the controller wires the store's
+// Notify wakes a client's hanging polls; the controller wires the store's
 // OnChange hook to it so every mutation path releases waiting agents.
-func (a *API) Notify(node string) { a.notifier.Wake(node) }
+func (a *API) Notify(client string) { a.notifier.Wake(client) }
 
 // WakeAll releases every hanging poll (graceful shutdown): handlers answer
 // immediately with the current version — agents reconnect to the new process
 // instead of waiting out the hold or eating a broken connection.
 func (a *API) WakeAll() {
 	a.shutdown.Store(true)
-	nodes, err := a.store.ListNodes()
+	clients, err := a.store.ListClients()
 	if err != nil {
 		return
 	}
-	for _, n := range nodes {
+	for _, n := range clients {
 		a.notifier.Wake(n.Name)
 	}
 }
@@ -269,7 +269,7 @@ func (a *API) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid public key", http.StatusBadRequest)
 		return
 	}
-	node, err := a.store.RedeemEnrollToken(req.Token)
+	client, err := a.store.RedeemEnrollToken(req.Token)
 	if errors.Is(err, store.ErrNotFound) {
 		http.Error(w, "invalid, expired, or already-used enrollment token", http.StatusForbidden)
 		return
@@ -278,9 +278,9 @@ func (a *API) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	certPEM, err := a.issuer.NewAgentCertFromKey(node, []byte(req.PublicKey))
+	certPEM, err := a.issuer.NewAgentCertFromKey(client, []byte(req.PublicKey))
 	if err != nil {
-		// The token is already burned; the node needs a fresh one.
+		// The token is already burned; the client needs a fresh one.
 		http.Error(w, "invalid public key ("+err.Error()+") — token consumed, mint a new one", http.StatusBadRequest)
 		return
 	}
@@ -289,12 +289,12 @@ func (a *API) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if err := a.store.EnsureNode(node, fp); err != nil {
+	if err := a.store.EnsureClient(client, fp); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(EnrollResponse{Node: node, CA: string(a.issuer.CAPEM()), Cert: string(certPEM)}); err != nil {
+	if err := json.NewEncoder(w).Encode(EnrollResponse{Client: client, CA: string(a.issuer.CAPEM()), Cert: string(certPEM)}); err != nil {
 		log.Printf("enroll response: %v", err)
 	}
 }
@@ -302,7 +302,7 @@ func (a *API) handleEnroll(w http.ResponseWriter, r *http.Request) {
 // handlePoll authenticates the agent by certificate CN plus fingerprint,
 // records its report, and returns the desired config when the agent's
 // version is stale. The fingerprint check is the revocation mechanism:
-// re-running `wgmgt server enroll <node>` issues a new certificate and
+// re-running `wgmgt server enroll <client>` issues a new certificate and
 // supersedes the old one immediately.
 func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
@@ -310,14 +310,14 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peerCert := r.TLS.PeerCertificates[0]
-	node := peerCert.Subject.CommonName
-	if node == "" || node == "wgmgt-ca" || node == "wgmgt-server" {
-		http.Error(w, "invalid node certificate", http.StatusUnauthorized)
+	client := peerCert.Subject.CommonName
+	if client == "" || client == "wgmgt-ca" || client == "wgmgt-server" {
+		http.Error(w, "invalid client certificate", http.StatusUnauthorized)
 		return
 	}
-	n, err := a.store.GetNode(node)
+	n, err := a.store.GetClient(client)
 	if errors.Is(err, store.ErrNotFound) {
-		http.Error(w, "node not enrolled", http.StatusForbidden)
+		http.Error(w, "client not enrolled", http.StatusForbidden)
 		return
 	}
 	if err != nil {
@@ -325,7 +325,7 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if fp := certFingerprint(peerCert); n.Fingerprint != "" && n.Fingerprint != fp {
-		http.Error(w, "certificate superseded (re-enroll the node)", http.StatusForbidden)
+		http.Error(w, "certificate superseded (re-enroll the client)", http.StatusForbidden)
 		return
 	}
 
@@ -335,14 +335,14 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	a.reports.Update(node, req.Status)
-	a.store.TouchNode(node, time.Now().UTC().Format(time.RFC3339))
+	a.reports.Update(client, req.Status)
+	a.store.TouchClient(client, time.Now().UTC().Format(time.RFC3339))
 
 	// Capture the wake channel BEFORE reading the version (see Notifier):
 	// changes racing this request are caught either by the channel close or
 	// by the version comparison, never by neither.
-	ch := a.notifier.WakeCh(node)
-	version, err := a.store.ConfigVersion(node)
+	ch := a.notifier.WakeCh(client)
+	version, err := a.store.ConfigVersion(client)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -358,8 +358,8 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 				timedOut = true // answer now so agents move to the new process
 				continue
 			}
-			ch = a.notifier.WakeCh(node)
-			if version, err = a.store.ConfigVersion(node); err != nil {
+			ch = a.notifier.WakeCh(client)
+			if version, err = a.store.ConfigVersion(client); err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
@@ -376,9 +376,9 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 	}{Version: version}
 
 	// "Different", not "greater": deleting the top-version interface lowers
-	// the node's MAX version, and that delete must reach the agent too.
+	// the client's MAX version, and that delete must reach the agent too.
 	if version != req.Since {
-		cfg, err := a.configFor(node)
+		cfg, err := a.configFor(client)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -410,19 +410,19 @@ func fingerprintPEM(certPEM []byte) (string, error) {
 	return certFingerprint(cert), nil
 }
 
-func (a *API) configFor(node string) ([]AgentInterface, error) {
-	ifaces, err := a.store.ListInterfaces(node)
+func (a *API) configFor(client string) ([]AgentInterface, error) {
+	ifaces, err := a.store.ListInterfaces(client)
 	if err != nil {
 		return nil, err
 	}
 	// Every interface (enabled or not) is pushed; agents leave disabled
-	// ones down so the config travels with the node.
-	peers, err := a.store.ListPeers(node, "")
+	// ones down so the config travels with the client.
+	peers, err := a.store.ListPeers(client, "")
 	if err != nil {
 		return nil, err
 	}
 	// Agents never need peers' client private keys — strip them so one
-	// compromised node cannot harvest its peers' client identities.
+	// compromised client cannot harvest its peers' client identities.
 	byIface := map[string][]store.Peer{}
 	for _, p := range peers {
 		p.ClientPrivateKey = ""

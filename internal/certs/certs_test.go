@@ -45,13 +45,13 @@ func TestCAIssueAndVerify(t *testing.T) {
 		t.Errorf("SANs missing: ips=%v dns=%v", srv.IPAddresses, srv.DNSNames)
 	}
 
-	agentPEM, _, err := ca.NewAgentCert("node1")
+	agentPEM, _, err := ca.NewAgentCert("client1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	agent := parse(t, agentPEM)
-	if agent.Subject.CommonName != "node1" {
-		t.Errorf("agent CN = %q, want node1", agent.Subject.CommonName)
+	if agent.Subject.CommonName != "client1" {
+		t.Errorf("agent CN = %q, want client1", agent.Subject.CommonName)
 	}
 	if err := agent.CheckSignatureFrom(ca.Cert); err != nil {
 		t.Errorf("agent cert not signed by CA: %v", err)
@@ -145,13 +145,13 @@ func TestNewAgentCertFromKey(t *testing.T) {
 	}
 	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
 
-	certPEM, err := ca.NewAgentCertFromKey("node7", pubPEM)
+	certPEM, err := ca.NewAgentCertFromKey("client7", pubPEM)
 	if err != nil {
 		t.Fatal(err)
 	}
 	cert := parse(t, certPEM)
-	if cert.Subject.CommonName != "node7" {
-		t.Errorf("CN = %q, want node7", cert.Subject.CommonName)
+	if cert.Subject.CommonName != "client7" {
+		t.Errorf("CN = %q, want client7", cert.Subject.CommonName)
 	}
 	if err := cert.CheckSignatureFrom(ca.Cert); err != nil {
 		t.Errorf("cert not signed by CA: %v", err)

@@ -157,7 +157,7 @@ func TestIfaceCreateRejectsPathTraversal(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.EnsureNode("n1", "fp"); err != nil {
+	if err := st.EnsureClient("n1", "fp"); err != nil {
 		t.Fatal(err)
 	}
 	srv, err := NewController(&app.App{Store: st, ConfDir: dir}, control.NewReports(), ControllerOpts{
@@ -172,7 +172,7 @@ func TestIfaceCreateRejectsPathTraversal(t *testing.T) {
 	cprefix := "/t/" + srv.Token()
 
 	for _, evil := range []string{"../../tmp/pwned", "a/b", "way.too.long.interface.name"} {
-		resp, err := noRedirect(t).PostForm(cts.URL+cprefix+"/node/n1/ifaces", url.Values{
+		resp, err := noRedirect(t).PostForm(cts.URL+cprefix+"/client/n1/ifaces", url.Values{
 			"name": {evil}, "address": {"10.0.0.1/24"},
 		})
 		if err != nil {
@@ -251,16 +251,16 @@ func newControllerServer(t *testing.T) (*httptest.Server, string, *store.Store) 
 	return ts, "/t/" + srv.Token(), st
 }
 
-func TestNodeAddShowsJoinCommand(t *testing.T) {
+func TestClientAddShowsJoinCommand(t *testing.T) {
 	ts, prefix, st := newControllerServer(t)
 
-	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/nodes", url.Values{"name": {"router9"}})
+	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/clients", url.Values{"name": {"router9"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("node add = %d, want 303", resp.StatusCode)
+		t.Fatalf("client add = %d, want 303", resp.StatusCode)
 	}
 	loc := resp.Header.Get("Location")
 
@@ -275,22 +275,22 @@ func TestNodeAddShowsJoinCommand(t *testing.T) {
 		t.Errorf("second view = %d, want 404", code)
 	}
 
-	// The pending node appears on the dashboard.
+	// The pending client appears on the dashboard.
 	if code, body := get(t, ts, prefix+"/"); code != http.StatusOK || !strings.Contains(body, "router9") {
-		t.Errorf("node not on dashboard (code %d)", code)
+		t.Errorf("client not on dashboard (code %d)", code)
 	}
 
-	// A redeemable token really exists for the node.
+	// A redeemable token really exists for the client.
 	toks, err := st.ListEnrollTokens("")
-	if err != nil || len(toks) != 1 || toks[0].Node != "router9" {
+	if err != nil || len(toks) != 1 || toks[0].Client != "router9" {
 		t.Errorf("outstanding tokens = %v, %v", toks, err)
 	}
 }
 
-func TestNodeAddValidatesName(t *testing.T) {
+func TestClientAddValidatesName(t *testing.T) {
 	ts, prefix, _ := newControllerServer(t)
 	for _, bad := range []string{"", "a/b", "lead ing", "-x"} {
-		resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/nodes", url.Values{"name": {bad}})
+		resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/clients", url.Values{"name": {bad}})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -301,9 +301,9 @@ func TestNodeAddValidatesName(t *testing.T) {
 	}
 }
 
-func TestNodeTokenRemintRevokesOld(t *testing.T) {
+func TestClientTokenRemintRevokesOld(t *testing.T) {
 	ts, prefix, st := newControllerServer(t)
-	if err := st.EnsureNodePending("n1"); err != nil {
+	if err := st.EnsureClientPending("n1"); err != nil {
 		t.Fatal(err)
 	}
 	first, err := st.CreateEnrollToken("n1", time.Hour)
@@ -311,7 +311,7 @@ func TestNodeTokenRemintRevokesOld(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/node/n1/token", nil)
+	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/client/n1/token", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,63 +334,63 @@ func TestNodeTokenRemintRevokesOld(t *testing.T) {
 	}
 }
 
-func TestNodeDeleteAndReuse(t *testing.T) {
+func TestClientDeleteAndReuse(t *testing.T) {
 	ts, prefix, st := newControllerServer(t)
-	if err := st.EnsureNodePending("router1"); err != nil {
+	if err := st.EnsureClientPending("router1"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.CreateEnrollToken("router1", time.Hour); err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/node/router1/rm", nil)
+	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/client/router1/rm", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("node delete = %d, want 303", resp.StatusCode)
+		t.Fatalf("client delete = %d, want 303", resp.StatusCode)
 	}
 	if loc := resp.Header.Get("Location"); loc != prefix+"/" {
 		t.Errorf("redirect = %q, want dashboard", loc)
 	}
 
-	if _, err := st.GetNode("router1"); !errors.Is(err, store.ErrNotFound) {
-		t.Errorf("GetNode = %v, want ErrNotFound", err)
+	if _, err := st.GetClient("router1"); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("GetClient = %v, want ErrNotFound", err)
 	}
 	if toks, err := st.ListEnrollTokens("router1"); err != nil || len(toks) != 0 {
 		t.Errorf("tokens after delete = %v, %v", toks, err)
 	}
 
 	// The name is free again: re-creating mints a fresh join command.
-	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/nodes", url.Values{"name": {"router1"}})
+	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/clients", url.Values{"name": {"router1"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusSeeOther {
-		t.Fatalf("node re-add = %d, want 303", resp.StatusCode)
+		t.Fatalf("client re-add = %d, want 303", resp.StatusCode)
 	}
 	if code, body := get(t, ts, resp.Header.Get("Location")); code != http.StatusOK || !strings.Contains(body, "--token") {
 		t.Fatalf("join page after re-add = %d\n%s", code, body)
 	}
 }
 
-func TestQuickAddPeerOnNodePage(t *testing.T) {
+func TestQuickAddPeerOnClientPage(t *testing.T) {
 	ts, prefix, st := newControllerServer(t)
-	st.EnsureNode("n1", "fp")
+	st.EnsureClient("n1", "fp")
 	key, _ := wgtypes.GeneratePrivateKey()
-	if err := st.CreateInterface(&store.Interface{Node: "n1", Name: "wg0", PrivateKey: key.String(), Address: "10.7.0.1/24", Enabled: true}); err != nil {
+	if err := st.CreateInterface(&store.Interface{Client: "n1", Name: "wg0", PrivateKey: key.String(), Address: "10.7.0.1/24", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 
-	// The node page renders the quick-add form with the interface select.
-	code, body := get(t, ts, prefix+"/node/n1")
+	// The client page renders the quick-add form with the interface select.
+	code, body := get(t, ts, prefix+"/client/n1")
 	if code != http.StatusOK || !strings.Contains(body, `name="iface"`) || !strings.Contains(body, "Quick add peer") {
-		t.Fatalf("node page missing quick-add (code %d)", code)
+		t.Fatalf("client page missing quick-add (code %d)", code)
 	}
 
-	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/node/n1/peers", url.Values{
+	resp, err := noRedirect(t).PostForm(ts.URL+prefix+"/client/n1/peers", url.Values{
 		"iface": {"wg0"}, "name": {"laptop"},
 	})
 	if err != nil {
@@ -409,7 +409,7 @@ func TestQuickAddPeerOnNodePage(t *testing.T) {
 	}
 
 	// Unknown interface is a 404, missing choice a 400.
-	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/node/n1/peers", url.Values{"iface": {"nope"}, "name": {"x"}})
+	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/client/n1/peers", url.Values{"iface": {"nope"}, "name": {"x"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -417,7 +417,7 @@ func TestQuickAddPeerOnNodePage(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("unknown iface = %d, want 404", resp.StatusCode)
 	}
-	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/node/n1/peers", url.Values{"name": {"x"}})
+	resp, err = noRedirect(t).PostForm(ts.URL+prefix+"/client/n1/peers", url.Values{"name": {"x"}})
 	if err != nil {
 		t.Fatal(err)
 	}

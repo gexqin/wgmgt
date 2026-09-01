@@ -1,15 +1,15 @@
 {{define "content"}}
 {{if .Controller}}
-<h1>Nodes</h1>
-{{if not .Nodes}}
-<p class="empty">No agents enrolled yet. Add a node below to mint a one-time
-enrollment token, then run the printed command on the node.</p>
+<h1>Clients</h1>
+{{if not .Clients}}
+<p class="empty">No agents enrolled yet. Add a client below to mint a one-time
+enrollment token, then run the printed command on the client.</p>
 {{else}}
 <div class="cards">
-{{range .Nodes}}
+{{range .Clients}}
   <div class="card">
     <div class="card-head">
-      <a class="card-title" href="{{u "node" .Name}}">{{.Name}}</a>
+      <a class="card-title" href="{{u "client" .Name}}">{{.Name}}</a>
       {{if .Quarantined}}<span class="state down">⚠ QUARANTINED</span>
       {{else}}<span class="state {{if .Online}}up{{else}}down{{end}}">{{if .Online}}● ONLINE{{else}}○ OFFLINE{{end}}</span>{{end}}
     </div>
@@ -18,13 +18,17 @@ enrollment token, then run the printed command on the node.</p>
       <div><dt>last seen</dt><dd>{{if .LastSeen}}{{.LastSeen}} ago{{else}}never{{end}}</dd></div>
     </dl>
     {{if .Quarantined}}<p class="empty">Rolled back after losing the controller — waiting for a newer config version.</p>{{end}}
+    <form method="post" action="{{u "client" .Name "rm"}}"
+      onsubmit="return confirm('Delete client {{.Name}} with all its interfaces, peers and tokens?')">
+      <button class="btn small danger" type="submit">Delete client</button>
+    </form>
   </div>
 {{end}}
 </div>
 {{end}}
 <section>
-<h2>Add node</h2>
-<form class="grid-form" method="post" action="{{u "nodes"}}">
+<h2>Add client</h2>
+<form class="grid-form" method="post" action="{{u "clients"}}">
   <label>Name <input name="name" required placeholder="router1"></label>
   <div><button class="btn primary" type="submit">Create enrollment token</button></div>
 </form>

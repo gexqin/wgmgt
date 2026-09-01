@@ -79,7 +79,7 @@ var serverCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		// Every store mutation wakes the node's hanging long-polls, so web
+		// Every store mutation wakes the client's hanging long-polls, so web
 		// console changes reach agents in milliseconds.
 		st.OnChange = api.Notify
 		apiSrv := api.Server(serverFlags.api, srvCert, caPool)
@@ -139,7 +139,7 @@ var serverCmd = &cobra.Command{
 }
 
 var serverEnrollCmd = &cobra.Command{
-	Use:   "enroll <node-name>",
+	Use:   "enroll <client-name>",
 	Short: "Issue an agent certificate and print its start command",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -170,7 +170,7 @@ var serverEnrollCmd = &cobra.Command{
 			return err
 		}
 
-		// Register the node with its certificate fingerprint.
+		// Register the client with its certificate fingerprint.
 		fp, err := certs.Fingerprint(certPEM)
 		if err != nil {
 			return err
@@ -180,27 +180,27 @@ var serverEnrollCmd = &cobra.Command{
 			return err
 		}
 		defer st.Close()
-		if err := st.EnsureNode(name, fp); err != nil {
+		if err := st.EnsureClient(name, fp); err != nil {
 			return err
 		}
 
 		out := cmd.OutOrStdout()
 		fmt.Fprintf(out, "Agent certificate issued for %q (fingerprint %s…)\n", name, fp[:16])
 		fmt.Fprintf(out, "  %s\n  %s\n  %s\n", certPath, keyPath, caPath)
-		fmt.Fprintf(out, "\nCopy these files to the node, then run there:\n")
+		fmt.Fprintf(out, "\nCopy these files to the client, then run there:\n")
 		fmt.Fprintf(out, "  sudo wgmgt agent --server https://%[1]s --ca ca.pem --cert %[2]s.pem --key %[2]s.key\n", apiAdvertise(serverFlags.api), name)
 		return nil
 	},
 }
 
 var serverTokenCmd = &cobra.Command{
-	Use:   "token <node-name>",
+	Use:   "token <client-name>",
 	Short: "Mint a one-time enrollment token and print the agent join command",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
-		if !store.ValidNodeName(name) {
-			return fmt.Errorf("invalid node name %q: must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$ (it becomes a URL path and a certificate CN)", name)
+		if !store.ValidClientName(name) {
+			return fmt.Errorf("invalid client name %q: must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$ (it becomes a URL path and a certificate CN)", name)
 		}
 		dir := serverFlags.dir
 		ca, err := certs.LoadOrNewCA(dir)
@@ -212,7 +212,7 @@ var serverTokenCmd = &cobra.Command{
 			return err
 		}
 		defer st.Close()
-		if err := st.EnsureNodePending(name); err != nil {
+		if err := st.EnsureClientPending(name); err != nil {
 			return err
 		}
 		token, err := st.CreateEnrollToken(name, tokenFlags.ttl)
@@ -222,7 +222,7 @@ var serverTokenCmd = &cobra.Command{
 		advertise := "https://" + apiAdvertise(serverFlags.api)
 		out := cmd.OutOrStdout()
 		fmt.Fprintf(out, "One-time enrollment token for %q (valid %s, single use):\n  %s\n", name, tokenFlags.ttl, token)
-		fmt.Fprintf(out, "\nOn the node run:\n")
+		fmt.Fprintf(out, "\nOn the client run:\n")
 		fmt.Fprintf(out, "  sudo wgmgt agent --server %s --token %s --ca-hash sha256:%s\n",
 			advertise, token, ca.CAFingerprint())
 		return nil

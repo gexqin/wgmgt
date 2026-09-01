@@ -70,10 +70,10 @@ func startController(t *testing.T, withRoot bool) (*store.Store, *certs.CA, stri
 
 func TestEnrollSuccess(t *testing.T) {
 	st, ca, url := startController(t, true)
-	if err := st.EnsureNodePending("node7"); err != nil {
+	if err := st.EnsureClientPending("client7"); err != nil {
 		t.Fatal(err)
 	}
-	token, err := st.CreateEnrollToken("node7", time.Hour)
+	token, err := st.CreateEnrollToken("client7", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

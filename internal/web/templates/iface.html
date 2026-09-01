@@ -1,14 +1,14 @@
 {{define "content"}}
 <h1>{{.Iface.Name}}
-  {{if .Iface.Node}}<span class="muted">on {{.Iface.Node}}</span>{{end}}
+  {{if .Iface.Client}}<span class="muted">on {{.Iface.Client}}</span>{{end}}
   <span class="state {{if .Up}}up{{else}}down{{end}}">{{if .Up}}● UP{{else}}{{if .Iface.Enabled}}○ DOWN{{else}}○ DISABLED{{end}}{{end}}</span>
 </h1>
 
 <div class="actions">
   {{if .Iface.Enabled}}
-  <form method="post" action="{{iu .Iface "down"}}"><button class="btn">{{if .Iface.Node}}Disable on node{{else}}Down{{end}}</button></form>
+  <form method="post" action="{{iu .Iface "down"}}"><button class="btn">{{if .Iface.Client}}Disable on client{{else}}Down{{end}}</button></form>
   {{else}}
-  <form method="post" action="{{iu .Iface "up"}}"><button class="btn primary">{{if .Iface.Node}}Enable on node{{else}}Up{{end}}</button></form>
+  <form method="post" action="{{iu .Iface "up"}}"><button class="btn primary">{{if .Iface.Client}}Enable on client{{else}}Up{{end}}</button></form>
   {{end}}
 </div>
 

@@ -30,7 +30,7 @@ var agentCmd = &cobra.Command{
 	Short: "Run the agent: pull config from the controller and apply it",
 	Long: "The agent is stateless besides its certificate and generated conf " +
 		"files. It connects out to the controller over mTLS and long-polls " +
-		"for its node's desired configuration (changes arrive in " +
+		"for its client's desired configuration (changes arrive in " +
 		"milliseconds), applies it via netlink, and reports live status " +
 		"with each poll.\n\n" +
 		"Bootstrap: with --token (and --ca-hash from the controller's join " +

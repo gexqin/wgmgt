@@ -1,7 +1,7 @@
 {{define "content"}}
-<h1>Node <span class="muted">{{.Node}}</span></h1>
+<h1>Client <span class="muted">{{.Client}}</span></h1>
 {{if not .Interfaces}}
-<p class="empty">No interfaces on this node yet — create one below.</p>
+<p class="empty">No interfaces on this client yet — create one below.</p>
 {{else}}
 <div class="cards">
 {{range .Interfaces}}
@@ -25,7 +25,7 @@
 {{if not .Interfaces}}
 <p class="empty">Create an interface first.</p>
 {{else}}
-<form class="grid-form" method="post" action="{{u "node" .Node "peers"}}">
+<form class="grid-form" method="post" action="{{u "client" .Client "peers"}}">
   <label>Interface
     <select name="iface" required>
       {{range .Interfaces}}<option value="{{.Name}}">{{.Name}} ({{.Address}})</option>{{end}}
@@ -43,33 +43,22 @@
 <p class="muted">{{if .Enrolled}}Enrolled — certificate active.{{else}}Pending — no certificate enrolled yet.{{end}}
 {{if .TokenExpiry}} A one-time token is outstanding (expires {{.TokenExpiry}}).
 {{else}} No outstanding token.{{end}}</p>
-<form method="post" action="{{u "node" .Node "token"}}">
+<form method="post" action="{{u "client" .Client "token"}}">
   <button class="btn" type="submit">Mint new enrollment token</button>
 </form>
-<p class="muted">Minting revokes any outstanding token for this node and shows
-a fresh join command once. For an enrolled node this is the re-enrollment
+<p class="muted">Minting revokes any outstanding token for this client and shows
+a fresh join command once. For an enrolled client this is the re-enrollment
 path: the new certificate supersedes the old one.</p>
 </section>
 
 <section>
 <h2>Add interface</h2>
-<form class="grid-form" method="post" action="{{u "node" .Node "ifaces"}}">
+<form class="grid-form" method="post" action="{{u "client" .Client "ifaces"}}">
   <label>Name <input name="name" required placeholder="wg0"></label>
   <label>Tunnel address <input name="address" required placeholder="10.0.0.1/24"></label>
   <label>Listen port <input name="port" type="number" placeholder="51820"></label>
   <label>MTU <input name="mtu" type="number" placeholder="auto"></label>
   <div><button class="btn primary" type="submit">Create interface</button></div>
 </form>
-</section>
-
-<section>
-<h2>Danger zone</h2>
-<form method="post" action="{{u "node" .Node "rm"}}"
-  onsubmit="return confirm('Delete node {{.Node}} with all its interfaces, peers and tokens?')">
-  <button class="btn danger" type="submit">Delete node</button>
-</form>
-<p class="muted">Removes the node's interfaces, peers and enrollment tokens; the
-name can be reused for a fresh node. An enrolled agent notices on its next
-poll and rolls its WireGuard config back by itself.</p>
 </section>
 {{end}}

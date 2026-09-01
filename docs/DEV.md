@@ -27,7 +27,7 @@ CGO_ENABLED=0 go build -trimpath \
 ./wgmgt version             # 验证:wgmgt v0.1.0 (5ecca4c) linux/amd64
 ```
 
-版本号基线:**v0.1.0 = M3 完成**(单机 CLI/Web/多节点主控+agent 全部可用)。
+版本号基线:**v0.1.0 = M3 完成**(单机 CLI/Web/多客户端主控+agent 全部可用)。
 `git describe --tags` 自动产出 `v0.1.0` / `v0.1.0-3-g1a2b3c4` 式版本串,
 M5 的语义化版本流程直接沿用此机制。
 
@@ -51,7 +51,7 @@ wgmgt/
 │   ├── confgen/        # wg-quick 兼容 conf 渲染(服务端 + 客户端)
 │   ├── control/        # 控制端:mTLS poll API、配置下发、状态上报缓存
 │   ├── humanize/       # 时长/字节的人类可读格式化
-│   ├── store/          # SQLite 存储(多节点:interfaces 按 (node,name) 主键)
+│   ├── store/          # SQLite 存储(多客户端:interfaces 按 (client,name) 主键)
 │   ├── web/            # 内嵌 Web UI(go:embed;本地/控制台双模式)
 │   ├── wgctl/          # netlink 应用层:up/down/热应用/状态读取
 │   └── wgkern/         # 内核 WireGuard 检测
@@ -64,7 +64,7 @@ wgmgt/
 ## 控制端 / agent 要点(M3)
 
 - **协议**:POST /api/poll,JSON over mTLS,**HTTP 长轮询**。agent 的
-  证书 CN 即节点名;请求体带 `since`(已应用的配置版本)+ 实时状态。
+  证书 CN 即客户端名;请求体带 `since`(已应用的配置版本)+ 实时状态。
   `since` 等于当前版本时服务端挂起至多 `--poll-hold`(默认 25s,0 关闭),
   直到版本变化(store 变更钩子经 Notifier 即时唤醒)、hold 到期或客户端
   断开;版本**不同**时(注意不是"更新"——删除接口会使版本**下降**)
@@ -72,7 +72,7 @@ wgmgt/
   立即重发(请求本身就是定时器),失败按 `--interval` 退避;状态随每轮
   长轮询上报,节奏 ≈ hold。进程外直改 DB 不触发钩子,一个 hold 周期内
   自愈。
-- **配置版本**:`interfaces.config_version` 每次变更 +1,节点版本取其
+- **配置版本**:`interfaces.config_version` 每次变更 +1,客户端版本取其
   接口的最大值。agent 只在版本变化时重新应用(避免重置 peer
   流量计数器)。
 - **agent 无状态**:唯一本地痕迹是 conf 目录(也作为"受管接口集合"
@@ -96,10 +96,10 @@ wgmgt/
   自己在 handler 层拒绝无证书请求(401)。服务端出示链**尾部追加
   根 CA 的 DER**——否则 agent 的 `--ca-hash` pin 无从比对。
 - **烧毁顺序**(fail-closed):先做廉价的公钥形状校验(坏请求不浪费
-  token)→ 烧毁 token → 签证书。签发失败时 token 已烧,节点须重铸。
-- **`EnsureNodePending` vs `EnsureNode`**:预注册 pending 节点必须用
+  token)→ 烧毁 token → 签证书。签发失败时 token 已烧,客户端须重铸。
+- **`EnsureClientPending` vs `EnsureClient`**:预注册 pending 客户端必须用
   前者(`ON CONFLICT DO NOTHING`);后者 upsert fingerprint,会把已
-  注册节点的指纹抹掉、破坏吊销。pending 节点 fingerprint 为空时
+  注册客户端的指纹抹掉、破坏吊销。pending 客户端 fingerprint 为空时
   poll 放行任意本 CA 签的同 CN 证书——可接受,因为只有控制端 CA
   能签发。
 - **agent 侧**(internal/agent/enroll.go):本地生成 P-256 密钥,只发
@@ -124,7 +124,7 @@ wgmgt/
   1. agent 的 HTTP client 不能用整体硬超时(会杀掉长轮询的 held 响应),
      但连接阶段必须有硬超时——黑洞里的 TCP connect 会挂死在 SYN 重传
      上,卡住整个 Run 循环,看门狗就永远不会被调度。正解是 transport
-     级:DialContext/TLSHandshakeTimeout 各 10s(锁死节点 ~10s 内失败),
+     级:DialContext/TLSHandshakeTimeout 各 10s(锁死客户端 ~10s 内失败),
      ResponseHeaderTimeout 60s 兜底沉默的控制端(服务端 `--poll-hold`
      必须小于它);
   2. 热更 peer 不会重装路由——0/0 加入时若只 ApplyPeers,策略路由
@@ -156,7 +156,7 @@ node 起 agent(--verify-timeout 12s)→ 正常接口 v1 ✓
   peers 片段单独解析供 htmx 轮询端点复用。
 - **htmx 只做一件事**:peer 表每 5 秒轮询刷新;操作(up/down/表单)
   都是普通 POST + 303,无 JS 也能用。
-- **一次性展示页**(控制端 Add node):join 命令存进程内 map(随机
+- **一次性展示页**(控制端 Add client):join 命令存进程内 map(随机
   id → 命令),GET `/enroll/{id}` 弹出即删,二次访问 404。token 本身
   一次性,页面同样一次性只是纵深防御。
 

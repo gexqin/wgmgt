@@ -147,15 +147,15 @@ func TestPollPushesConfigAndRecordsReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.CreateInterface(&store.Interface{Node: "n1", Name: "wg0", PrivateKey: "k", Address: "10.5.0.1/24", Enabled: true}); err != nil {
+	if err := st.CreateInterface(&store.Interface{Client: "n1", Name: "wg0", PrivateKey: "k", Address: "10.5.0.1/24", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.AddPeer(&store.Peer{Node: "n1", Interface: "wg0", Name: "p1", PublicKey: "pub", AllowedIPs: "10.5.0.2/32", ClientPrivateKey: "SECRET-CLIENT-KEY"}); err != nil {
+	if err := st.AddPeer(&store.Peer{Client: "n1", Interface: "wg0", Name: "p1", PublicKey: "pub", AllowedIPs: "10.5.0.2/32", ClientPrivateKey: "SECRET-CLIENT-KEY"}); err != nil {
 		t.Fatal(err)
 	}
 
 	p := newPKI(t, "n1")
-	if err := st.EnsureNode("n1", p.agentFP); err != nil {
+	if err := st.EnsureClient("n1", p.agentFP); err != nil {
 		t.Fatal(err)
 	}
 	reports := NewReports()
@@ -197,8 +197,8 @@ func TestPollPushesConfigAndRecordsReport(t *testing.T) {
 	}
 
 	// last_seen updated.
-	nodes, _ := st.ListNodes()
-	if nodes[0].LastSeen == "" {
+	clients, _ := st.ListClients()
+	if clients[0].LastSeen == "" {
 		t.Error("last_seen not recorded")
 	}
 }
@@ -229,12 +229,12 @@ func TestPollEnforcesFingerprint(t *testing.T) {
 
 	// Not enrolled at all.
 	if code, _ := poll(t, c, ts.URL, 0); code != http.StatusForbidden {
-		t.Errorf("unenrolled node = %d, want 403", code)
+		t.Errorf("unenrolled client = %d, want 403", code)
 	}
 
 	// Enrolled with a different (superseded) fingerprint — the revocation
 	// path: re-enroll replaces the fingerprint, old cert stops working.
-	if err := st.EnsureNode("n1", "superseded-fingerprint"); err != nil {
+	if err := st.EnsureClient("n1", "superseded-fingerprint"); err != nil {
 		t.Fatal(err)
 	}
 	if code, _ := poll(t, c, ts.URL, 0); code != http.StatusForbidden {
@@ -242,7 +242,7 @@ func TestPollEnforcesFingerprint(t *testing.T) {
 	}
 
 	// Enrolled with the real fingerprint — allowed.
-	if err := st.EnsureNode("n1", p.agentFP); err != nil {
+	if err := st.EnsureClient("n1", p.agentFP); err != nil {
 		t.Fatal(err)
 	}
 	if code, _ := poll(t, c, ts.URL, 0); code != http.StatusOK {
@@ -318,10 +318,10 @@ func TestEnrollIssuesCertForPublicKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer st.Close()
-	if err := st.EnsureNodePending("node7"); err != nil {
+	if err := st.EnsureClientPending("client7"); err != nil {
 		t.Fatal(err)
 	}
-	token, err := st.CreateEnrollToken("node7", time.Hour)
+	token, err := st.CreateEnrollToken("client7", time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,7 +334,7 @@ func TestEnrollIssuesCertForPublicKey(t *testing.T) {
 	if code != http.StatusOK {
 		t.Fatalf("enroll = %d %+v", code, resp)
 	}
-	if resp.Node != "node7" || resp.CA == "" || resp.Cert == "" {
+	if resp.Client != "client7" || resp.CA == "" || resp.Cert == "" {
 		t.Fatalf("enroll response incomplete: %+v", resp)
 	}
 
@@ -344,7 +344,7 @@ func TestEnrollIssuesCertForPublicKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cert.Subject.CommonName != "node7" {
+	if cert.Subject.CommonName != "client7" {
 		t.Errorf("cert CN = %q", cert.Subject.CommonName)
 	}
 	if err := cert.CheckSignatureFrom(p.ca.Cert); err != nil {
@@ -452,7 +452,7 @@ func TestPollVerifiesTimeIntervalSanity(t *testing.T) {
 	}
 }
 
-// newLongPollFixture builds a one-interface store + enrolled node + holding
+// newLongPollFixture builds a one-interface store + enrolled client + holding
 // API server; the shared setup of the long-poll tests.
 func newLongPollFixture(t *testing.T, hold time.Duration) (*store.Store, *http.Client, string, *API) {
 	t.Helper()
@@ -461,11 +461,11 @@ func newLongPollFixture(t *testing.T, hold time.Duration) (*store.Store, *http.C
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	if err := st.CreateInterface(&store.Interface{Node: "n1", Name: "wg0", PrivateKey: "k", Address: "10.5.0.1/24", Enabled: true}); err != nil {
+	if err := st.CreateInterface(&store.Interface{Client: "n1", Name: "wg0", PrivateKey: "k", Address: "10.5.0.1/24", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	p := newPKI(t, "n1")
-	if err := st.EnsureNode("n1", p.agentFP); err != nil {
+	if err := st.EnsureClient("n1", p.agentFP); err != nil {
 		t.Fatal(err)
 	}
 	ts, api := newAPIServer(t, st, p, NewReports(), hold)
@@ -526,7 +526,7 @@ func TestLongPollWakesOnVersionDrop(t *testing.T) {
 	// A second interface at v1; wg0 has been bumped to v3 by peer churn.
 	st.SetEnabled("n1", "wg0", false)
 	st.SetEnabled("n1", "wg0", true)
-	if err := st.CreateInterface(&store.Interface{Node: "n1", Name: "wg1", PrivateKey: "k", Address: "10.6.0.1/24", Enabled: true}); err != nil {
+	if err := st.CreateInterface(&store.Interface{Client: "n1", Name: "wg1", PrivateKey: "k", Address: "10.6.0.1/24", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	v, _ := st.ConfigVersion("n1")
@@ -541,7 +541,7 @@ func TestLongPollWakesOnVersionDrop(t *testing.T) {
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	// Deleting the top-version interface DROPS the node's MAX version; the
+	// Deleting the top-version interface DROPS the client's MAX version; the
 	// poll must still wake and push (version "different", not "greater").
 	if err := st.DeleteInterface("n1", "wg0"); err != nil {
 		t.Fatal(err)

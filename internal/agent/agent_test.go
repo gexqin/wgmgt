@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// The watchdog state machine is what keeps a locked-out node recoverable;
+// The watchdog state machine is what keeps a locked-out client recoverable;
 // these tests pin its decisions without touching the network.
 
 func TestWatchdogRollsBackUnverifiedConfig(t *testing.T) {
@@ -83,8 +83,8 @@ func TestQuarantinePersistsAcrossRestart(t *testing.T) {
 func TestQuarantineRejectsOnlyTheBadVersion(t *testing.T) {
 	// Mirrors the gate in PollOnce: quarantined at v7 means exactly v7 stays
 	// rejected. Not <=: versions can DROP (deleting the top-version
-	// interface lowers the node's MAX), and a fixed config must be allowed
-	// to carry a lower number — otherwise the node never recovers.
+	// interface lowers the client's MAX), and a fixed config must be allowed
+	// to carry a lower number — otherwise the client never recovers.
 	a := &Agent{quarantinedVer: 7}
 	rejected := func(v int64) bool { return v == a.quarantinedVer }
 	if !rejected(7) {

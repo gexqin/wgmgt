@@ -1,12 +1,15 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func open(t *testing.T) *Store {
@@ -19,9 +22,39 @@ func open(t *testing.T) *Store {
 	return s
 }
 
-func mustCreate(t *testing.T, s *Store, node, name string) *Interface {
+// TestLegacySchemaRejected feeds Open the two pre-rename shapes: an M3-era
+// controller db (nodes registry table) and an M1-era single-host db
+// (interfaces still keyed by the "node" column, no registry). Both must
+// fail with ErrLegacySchema instead of a confusing SQL error — even when
+// the tables are empty, the DDL would already trip over them.
+func TestLegacySchemaRejected(t *testing.T) {
+	for name, ddl := range map[string]string{
+		"m3-controller": `CREATE TABLE nodes (name TEXT PRIMARY KEY);
+CREATE TABLE interfaces (name TEXT, node TEXT NOT NULL DEFAULT '', private_key TEXT NOT NULL);
+CREATE TABLE peers (id INTEGER PRIMARY KEY, interface TEXT, node TEXT NOT NULL DEFAULT '')`,
+		"m1-single-host": `CREATE TABLE interfaces (name TEXT, node TEXT NOT NULL DEFAULT '', private_key TEXT NOT NULL)`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "legacy.db")
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(ddl); err != nil {
+				t.Fatal(err)
+			}
+			db.Close()
+			s, err := Open(path)
+			if !errors.Is(err, ErrLegacySchema) {
+				t.Fatalf("Open = %v, %v; want ErrLegacySchema", s, err)
+			}
+		})
+	}
+}
+
+func mustCreate(t *testing.T, s *Store, client, name string) *Interface {
 	t.Helper()
-	i := &Interface{Node: node, Name: name, PrivateKey: "k", Address: "10.0.0.1/24", ListenPort: 51820, Enabled: true}
+	i := &Interface{Client: client, Name: name, PrivateKey: "k", Address: "10.0.0.1/24", ListenPort: 51820, Enabled: true}
 	if err := s.CreateInterface(i); err != nil {
 		t.Fatal(err)
 	}
@@ -56,20 +89,20 @@ func TestInterfaceCRUD(t *testing.T) {
 	}
 }
 
-func TestSameNameOnDifferentNodes(t *testing.T) {
+func TestSameNameOnDifferentClients(t *testing.T) {
 	s := open(t)
 	mustCreate(t, s, "n1", "wg0")
 	mustCreate(t, s, "n2", "wg0")
 
-	for _, node := range []string{"n1", "n2"} {
-		ifc, err := s.GetInterface(node, "wg0")
-		if err != nil || ifc.Node != node {
-			t.Errorf("GetInterface(%s) = %+v, %v", node, ifc, err)
+	for _, client := range []string{"n1", "n2"} {
+		ifc, err := s.GetInterface(client, "wg0")
+		if err != nil || ifc.Client != client {
+			t.Errorf("GetInterface(%s) = %+v, %v", client, ifc, err)
 		}
 	}
 	all, _ := s.ListInterfaces("")
 	if len(all) != 2 {
-		t.Errorf("ListInterfaces('') = %d rows, want 2 (all nodes)", len(all))
+		t.Errorf("ListInterfaces('') = %d rows, want 2 (all clients)", len(all))
 	}
 	if err := s.DeleteInterface("n1", "wg0"); err != nil {
 		t.Fatal(err)
@@ -145,27 +178,27 @@ func TestPeerMutationBumpsVersion(t *testing.T) {
 	}
 }
 
-func TestDeleteNodeCascadesAndAllowsReuse(t *testing.T) {
+func TestDeleteClientCascadesAndAllowsReuse(t *testing.T) {
 	s := open(t)
-	if err := s.EnsureNodePending("n1"); err != nil {
+	if err := s.EnsureClientPending("n1"); err != nil {
 		t.Fatal(err)
 	}
 	mustCreate(t, s, "n1", "wg0")
-	if err := s.AddPeer(&Peer{Node: "n1", Interface: "wg0", Name: "laptop", PublicKey: "pub1", AllowedIPs: "10.0.0.2/32"}); err != nil {
+	if err := s.AddPeer(&Peer{Client: "n1", Interface: "wg0", Name: "laptop", PublicKey: "pub1", AllowedIPs: "10.0.0.2/32"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.CreateEnrollToken("n1", time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.EnsureNode("n2", "fp"); err != nil {
+	if err := s.EnsureClient("n2", "fp"); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := s.DeleteNode("n1"); err != nil {
+	if err := s.DeleteClient("n1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetNode("n1"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("GetNode = %v, want ErrNotFound", err)
+	if _, err := s.GetClient("n1"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("GetClient = %v, want ErrNotFound", err)
 	}
 	if ifcs, err := s.ListInterfaces("n1"); err != nil || len(ifcs) != 0 {
 		t.Errorf("interfaces after delete = %v, %v", ifcs, err)
@@ -176,48 +209,48 @@ func TestDeleteNodeCascadesAndAllowsReuse(t *testing.T) {
 	if toks, err := s.ListEnrollTokens("n1"); err != nil || len(toks) != 0 {
 		t.Errorf("tokens after delete = %v, %v", toks, err)
 	}
-	if nodes, _ := s.ListNodes(); len(nodes) != 1 || nodes[0].Name != "n2" {
-		t.Errorf("siblings must survive, nodes = %v", nodes)
+	if clients, _ := s.ListClients(); len(clients) != 1 || clients[0].Name != "n2" {
+		t.Errorf("siblings must survive, clients = %v", clients)
 	}
 
-	// The name is free again: a fresh node can take it.
-	if err := s.EnsureNodePending("n1"); err != nil {
+	// The name is free again: a fresh client can take it.
+	if err := s.EnsureClientPending("n1"); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.GetNode("n1"); err != nil || n.Fingerprint != "" {
-		t.Errorf("recreated node = %+v, %v", n, err)
+	if n, err := s.GetClient("n1"); err != nil || n.Fingerprint != "" {
+		t.Errorf("recreated client = %+v, %v", n, err)
 	}
 }
 
-func TestNodeRegistry(t *testing.T) {
+func TestClientRegistry(t *testing.T) {
 	s := open(t)
-	if err := s.EnsureNode("n1", "AA:BB"); err != nil {
+	if err := s.EnsureClient("n1", "AA:BB"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.EnsureNode("n1", "CC:DD"); err != nil { // upsert fingerprint
+	if err := s.EnsureClient("n1", "CC:DD"); err != nil { // upsert fingerprint
 		t.Fatal(err)
 	}
-	if err := s.EnsureNode("n2", "EE:FF"); err != nil {
+	if err := s.EnsureClient("n2", "EE:FF"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.TouchNode("n1", "2026-08-27T10:00:00Z"); err != nil {
+	if err := s.TouchClient("n1", "2026-08-27T10:00:00Z"); err != nil {
 		t.Fatal(err)
 	}
-	nodes, err := s.ListNodes()
-	if err != nil || len(nodes) != 2 {
-		t.Fatalf("ListNodes = %v, %v", nodes, err)
+	clients, err := s.ListClients()
+	if err != nil || len(clients) != 2 {
+		t.Fatalf("ListClients = %v, %v", clients, err)
 	}
-	for _, n := range nodes {
+	for _, n := range clients {
 		if n.Name == "n1" && (n.Fingerprint != "CC:DD" || n.LastSeen != "2026-08-27T10:00:00Z") {
 			t.Errorf("n1 = %+v", n)
 		}
 	}
 }
 
-func TestConfigVersionPerNode(t *testing.T) {
+func TestConfigVersionPerClient(t *testing.T) {
 	s := open(t)
 	if v, err := s.ConfigVersion("n1"); err != nil || v != 0 {
-		t.Fatalf("empty node version = %d, %v", v, err)
+		t.Fatalf("empty client version = %d, %v", v, err)
 	}
 	mustCreate(t, s, "n1", "wg0")
 	if v, _ := s.ConfigVersion("n1"); v != 1 {
@@ -230,17 +263,17 @@ func TestConfigVersionPerNode(t *testing.T) {
 
 func TestChangeHookFires(t *testing.T) {
 	// The hook is the controller's long-poll wake path: every mutation that
-	// can change a node's config version must fire it with the right node.
+	// can change a client's config version must fire it with the right client.
 	s := open(t)
 	mustCreate(t, s, "n1", "wg0")
 
 	var got []string
-	s.OnChange = func(node string) { got = append(got, node) }
+	s.OnChange = func(client string) { got = append(got, client) }
 
-	s.CreateInterface(&Interface{Node: "n2", Name: "wg0", PrivateKey: "k", Address: "10.0.0.2/24"})
+	s.CreateInterface(&Interface{Client: "n2", Name: "wg0", PrivateKey: "k", Address: "10.0.0.2/24"})
 	s.SetEnabled("n1", "wg0", false)
 	s.UpdateServerEndpoint("n1", "wg0", "vpn.example.com:51820")
-	s.AddPeer(&Peer{Node: "n1", Interface: "wg0", Name: "p", PublicKey: "pub1", AllowedIPs: "10.0.0.3/32"})
+	s.AddPeer(&Peer{Client: "n1", Interface: "wg0", Name: "p", PublicKey: "pub1", AllowedIPs: "10.0.0.3/32"})
 	s.DeletePeer("n1", "wg0", "pub1")
 	s.DeleteInterface("n2", "wg0")
 
@@ -256,8 +289,8 @@ func TestChangeHookFires(t *testing.T) {
 
 	// Registry writes are not config changes — must not fire.
 	got = nil
-	s.EnsureNode("n3", "fp")
-	s.TouchNode("n3", "now")
+	s.EnsureClient("n3", "fp")
+	s.TouchClient("n3", "now")
 	if len(got) != 0 {
 		t.Errorf("registry writes must not fire the hook: %v", got)
 	}
@@ -279,9 +312,9 @@ func TestEnrollTokenLifecycle(t *testing.T) {
 		t.Fatalf("token len = %d, want 48", len(token))
 	}
 
-	node, err := s.RedeemEnrollToken(token)
-	if err != nil || node != "router1" {
-		t.Fatalf("redeem = %q, %v", node, err)
+	client, err := s.RedeemEnrollToken(token)
+	if err != nil || client != "router1" {
+		t.Fatalf("redeem = %q, %v", client, err)
 	}
 	if _, err := s.RedeemEnrollToken(token); !errors.Is(err, ErrNotFound) {
 		t.Error("double redeem must fail")
@@ -321,7 +354,7 @@ func TestEnrollTokenLifecycle(t *testing.T) {
 		t.Error("revoked token redeemed")
 	}
 	if _, err := s.RedeemEnrollToken(t2); err != nil {
-		t.Error("revocation must not touch other nodes' tokens")
+		t.Error("revocation must not touch other clients' tokens")
 	}
 }
 
@@ -348,38 +381,38 @@ func TestEnrollTokenConcurrentRedeem(t *testing.T) {
 	}
 }
 
-func TestValidNodeName(t *testing.T) {
-	for _, ok := range []string{"a", "router1", "node-2", "a.b_c", "AbC123"} {
-		if !ValidNodeName(ok) {
-			t.Errorf("ValidNodeName(%q) = false", ok)
+func TestValidClientName(t *testing.T) {
+	for _, ok := range []string{"a", "router1", "client-2", "a.b_c", "AbC123"} {
+		if !ValidClientName(ok) {
+			t.Errorf("ValidClientName(%q) = false", ok)
 		}
 	}
 	for _, bad := range []string{"", "-a", "a/b", "a b", ".", "a:b", string(make([]byte, 65))} {
-		if ValidNodeName(bad) {
-			t.Errorf("ValidNodeName(%q) = true", bad)
+		if ValidClientName(bad) {
+			t.Errorf("ValidClientName(%q) = true", bad)
 		}
 	}
 }
 
-func TestEnsureNodePendingKeepsFingerprint(t *testing.T) {
+func TestEnsureClientPendingKeepsFingerprint(t *testing.T) {
 	s := open(t)
-	if err := s.EnsureNode("n1", "AA:BB"); err != nil {
+	if err := s.EnsureClient("n1", "AA:BB"); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.EnsureNodePending("n1"); err != nil {
+	if err := s.EnsureClientPending("n1"); err != nil {
 		t.Fatal(err)
 	}
-	n, err := s.GetNode("n1")
+	n, err := s.GetClient("n1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n.Fingerprint != "AA:BB" {
 		t.Errorf("fingerprint = %q, want AA:BB (pending must not clobber)", n.Fingerprint)
 	}
-	if err := s.EnsureNodePending("n2"); err != nil {
+	if err := s.EnsureClientPending("n2"); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := s.GetNode("n2"); err != nil || n.Fingerprint != "" {
-		t.Errorf("new pending node = %+v, %v", n, err)
+	if n, err := s.GetClient("n2"); err != nil || n.Fingerprint != "" {
+		t.Errorf("new pending client = %+v, %v", n, err)
 	}
 }

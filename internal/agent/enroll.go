@@ -65,7 +65,7 @@ func Enroll(ctx context.Context, serverURL, token, caHash, confDir string) (caPE
 		host = u.Hostname()
 	}
 
-	// The private key never leaves this node: only its public half travels.
+	// The private key never leaves this client: only its public half travels.
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, nil, nil, err

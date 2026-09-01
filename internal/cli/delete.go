@@ -11,10 +11,6 @@ import (
 	"github.com/gexqin/wgmgt/internal/wgctl"
 )
 
-// errKeepExisting makes init exit cleanly when the user chooses to keep an
-// already-managed interface instead of re-creating it.
-var errKeepExisting = errors.New("kept existing interface")
-
 var deleteFlags struct {
 	yes bool
 }

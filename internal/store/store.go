@@ -2,7 +2,7 @@
 //
 // SQLite is the single source of truth; wg-quick-compatible conf files are
 // generated artifacts derived from it (see internal/confgen). The controller
-// (wgmgt server) additionally records which node owns each interface.
+// (wgmgt server) additionally records which client owns each interface.
 package store
 
 import (
@@ -22,20 +22,25 @@ import (
 // ErrNotFound is returned when a requested row does not exist.
 var ErrNotFound = errors.New("not found")
 
+// ErrLegacySchema is returned by Open for databases created before the
+// node→client rename. They are not migrated; `wgmgt init` offers a full
+// reset (wipe the db, regenerate everything).
+var ErrLegacySchema = errors.New("legacy database (created before the node→client rename)")
+
 // Store wraps the SQLite database.
 type Store struct {
 	db *sql.DB
 
-	// OnChange, when set, is invoked with the node after any mutation that
-	// can change a node's config version. The controller wires it to wake
+	// OnChange, when set, is invoked with the client after any mutation that
+	// can change a client's config version. The controller wires it to wake
 	// hanging long-polls; it is nil in CLI/local mode.
-	OnChange func(node string)
+	OnChange func(client string)
 }
 
 // changed fires the OnChange hook (a no-op when unset).
-func (s *Store) changed(node string) {
+func (s *Store) changed(client string) {
 	if s.OnChange != nil {
-		s.OnChange(node)
+		s.OnChange(client)
 	}
 }
 
@@ -55,6 +60,9 @@ func Open(path string) (*Store, error) {
 	}
 	if err := migrate(db); err != nil {
 		db.Close()
+		if errors.Is(err, ErrLegacySchema) {
+			return nil, fmt.Errorf("%w at %s: re-run `wgmgt init` and confirm the reset, or remove the file", err, path)
+		}
 		return nil, err
 	}
 	os.Chmod(path, 0o600) // best effort; may be read-only mounts
@@ -65,10 +73,18 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func migrate(db *sql.DB) error {
+	// Detect pre-rename databases BEFORE the DDL: CREATE INDEX on an old
+	// peers table would fail with a confusing "no such column: client",
+	// and every query afterwards would too. init offers a full reset.
+	if legacy, err := isLegacySchema(db); err != nil {
+		return err
+	} else if legacy {
+		return ErrLegacySchema
+	}
 	const ddl = `
 CREATE TABLE IF NOT EXISTS interfaces (
   name           TEXT NOT NULL,
-  node           TEXT NOT NULL DEFAULT '',
+  client         TEXT NOT NULL DEFAULT '',
   private_key    TEXT NOT NULL,
   listen_port    INTEGER NOT NULL DEFAULT 0,
   address        TEXT NOT NULL,
@@ -82,12 +98,12 @@ CREATE TABLE IF NOT EXISTS interfaces (
   enabled        INTEGER NOT NULL DEFAULT 1,
   config_version INTEGER NOT NULL DEFAULT 1,
   created_at     TEXT NOT NULL DEFAULT (datetime('now')),
-  PRIMARY KEY (node, name)
+  PRIMARY KEY (client, name)
 );
 CREATE TABLE IF NOT EXISTS peers (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   interface         TEXT NOT NULL,
-  node              TEXT NOT NULL DEFAULT '',
+  client            TEXT NOT NULL DEFAULT '',
   name              TEXT NOT NULL,
   public_key        TEXT NOT NULL UNIQUE,
   client_private_key TEXT NOT NULL DEFAULT '',
@@ -96,10 +112,10 @@ CREATE TABLE IF NOT EXISTS peers (
   endpoint          TEXT NOT NULL DEFAULT '',
   keepalive         INTEGER NOT NULL DEFAULT 0,
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (node, interface) REFERENCES interfaces(node, name) ON DELETE CASCADE
+  FOREIGN KEY (client, interface) REFERENCES interfaces(client, name) ON DELETE CASCADE
 );
-CREATE INDEX IF NOT EXISTS idx_peers_interface ON peers(node, interface);
-CREATE TABLE IF NOT EXISTS nodes (
+CREATE INDEX IF NOT EXISTS idx_peers_interface ON peers(client, interface);
+CREATE TABLE IF NOT EXISTS clients (
   name        TEXT PRIMARY KEY,
   fingerprint TEXT NOT NULL DEFAULT '',
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -107,33 +123,49 @@ CREATE TABLE IF NOT EXISTS nodes (
 );
 CREATE TABLE IF NOT EXISTS enroll_tokens (
   token_hash TEXT PRIMARY KEY,   -- hex sha256 of the plaintext token
-  node       TEXT NOT NULL,
+  client     TEXT NOT NULL,
   created_at TEXT NOT NULL,      -- all three time columns are written from Go
   expires_at TEXT NOT NULL,      -- as RFC3339 UTC; datetime('now') defaults
   used_at    TEXT NOT NULL DEFAULT '' -- elsewhere do not sort with them
 );
-CREATE INDEX IF NOT EXISTS idx_enroll_tokens_node ON enroll_tokens(node);
+CREATE INDEX IF NOT EXISTS idx_enroll_tokens_client ON enroll_tokens(client);
 `
-	if _, err := db.Exec(ddl); err != nil {
-		return err
-	}
-	// Upgrade older single-host databases: (node, name) became the key.
-	// Recreate is only possible if empty; otherwise report the mismatch.
-	var count int
-	if err := db.QueryRow("SELECT COUNT(*) FROM interfaces").Scan(&count); err != nil {
-		return err
-	}
-	if count > 0 {
-		var hasNode sql.NullString
-		if err := db.QueryRow("SELECT node FROM interfaces LIMIT 1").Scan(&hasNode); err != nil {
-			return fmt.Errorf("legacy database detected (interfaces table without node column); delete the db or migrate manually: %w", err)
-		}
-	}
-	return nil
+	_, err := db.Exec(ddl)
+	return err
 }
 
-// Node is a managed machine known to the controller.
-type Node struct {
+// isLegacySchema reports whether db predates the node→client rename: an
+// old "nodes" registry table, or an interfaces table still keyed by the
+// "node" column.
+func isLegacySchema(db *sql.DB) (bool, error) {
+	for _, table := range []string{"nodes", "interfaces"} {
+		var n int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?`, table,
+		).Scan(&n); err != nil {
+			return false, err
+		}
+		if n == 0 {
+			continue
+		}
+		if table == "nodes" {
+			return true, nil // the registry is only called "nodes" pre-rename
+		}
+		var col int
+		if err := db.QueryRow(
+			`SELECT COUNT(*) FROM pragma_table_info('interfaces') WHERE name='client'`,
+		).Scan(&col); err != nil {
+			return false, err
+		}
+		if col == 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Client is a managed machine known to the controller.
+type Client struct {
 	Name        string
 	Fingerprint string
 	LastSeen    string
@@ -141,7 +173,7 @@ type Node struct {
 
 // Interface is a managed WireGuard interface.
 type Interface struct {
-	Node           string `json:"node"`
+	Client           string `json:"client"`
 	Name           string `json:"name"`
 	PrivateKey     string `json:"private_key"`
 	ListenPort     int    `json:"listen_port"`
@@ -162,7 +194,7 @@ type Interface struct {
 // USAGE.md (DB is 0600 and already holds the server private key).
 type Peer struct {
 	ID               int64  `json:"id"`
-	Node             string `json:"node"`
+	Client             string `json:"client"`
 	Interface        string `json:"interface"`
 	Name             string `json:"name"`
 	PublicKey        string `json:"public_key"`
@@ -173,8 +205,8 @@ type Peer struct {
 	Keepalive        int    `json:"keepalive"`
 }
 
-const ifaceCols = `node, name, private_key, listen_port, address, mtu, dns, route_table, fwmark, server_endpoint, post_up, post_down, enabled, config_version`
-const peerCols = `id, node, interface, name, public_key, client_private_key, preshared_key, allowed_ips, endpoint, keepalive`
+const ifaceCols = `client, name, private_key, listen_port, address, mtu, dns, route_table, fwmark, server_endpoint, post_up, post_down, enabled, config_version`
+const peerCols = `id, client, interface, name, public_key, client_private_key, preshared_key, allowed_ips, endpoint, keepalive`
 
 // CreateInterface inserts a new interface.
 func (s *Store) CreateInterface(i *Interface) error {
@@ -183,34 +215,34 @@ func (s *Store) CreateInterface(i *Interface) error {
 	}
 	_, err := s.db.Exec(`INSERT INTO interfaces
 		(`+ifaceCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		i.Node, i.Name, i.PrivateKey, i.ListenPort, i.Address, i.MTU, i.DNS, i.RouteTable, i.Fwmark, i.ServerEndpoint, i.PostUp, i.PostDown, i.Enabled, i.ConfigVersion)
+		i.Client, i.Name, i.PrivateKey, i.ListenPort, i.Address, i.MTU, i.DNS, i.RouteTable, i.Fwmark, i.ServerEndpoint, i.PostUp, i.PostDown, i.Enabled, i.ConfigVersion)
 	if err != nil {
 		return err
 	}
-	s.changed(i.Node)
+	s.changed(i.Client)
 	return nil
 }
 
 func scanIface(row interface{ Scan(...any) error }) (*Interface, error) {
 	var i Interface
-	err := row.Scan(&i.Node, &i.Name, &i.PrivateKey, &i.ListenPort, &i.Address, &i.MTU, &i.DNS, &i.RouteTable, &i.Fwmark, &i.ServerEndpoint, &i.PostUp, &i.PostDown, &i.Enabled, &i.ConfigVersion)
+	err := row.Scan(&i.Client, &i.Name, &i.PrivateKey, &i.ListenPort, &i.Address, &i.MTU, &i.DNS, &i.RouteTable, &i.Fwmark, &i.ServerEndpoint, &i.PostUp, &i.PostDown, &i.Enabled, &i.ConfigVersion)
 	return &i, err
 }
 
-// GetInterface returns the interface with the given name. In a multi-node
-// database pass the node; with a single-host database node is "".
-func (s *Store) GetInterface(node, name string) (*Interface, error) {
-	i, err := scanIface(s.db.QueryRow(`SELECT `+ifaceCols+` FROM interfaces WHERE node = ? AND name = ?`, node, name))
+// GetInterface returns the interface with the given name. In a multi-client
+// database pass the client; with a single-host database client is "".
+func (s *Store) GetInterface(client, name string) (*Interface, error) {
+	i, err := scanIface(s.db.QueryRow(`SELECT `+ifaceCols+` FROM interfaces WHERE client = ? AND name = ?`, client, name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("%w: interface %q", ErrNotFound, name)
 	}
 	return i, err
 }
 
-// ListInterfaces returns all interfaces (optionally of one node).
-func (s *Store) ListInterfaces(node string) ([]Interface, error) {
+// ListInterfaces returns all interfaces (optionally of one client).
+func (s *Store) ListInterfaces(client string) ([]Interface, error) {
 	rows, err := s.db.Query(`SELECT `+ifaceCols+` FROM interfaces`+
-		whereNode(node)+" ORDER BY node, name", nodeArgs(node)...)
+		whereClient(client)+" ORDER BY client, name", clientArgs(client)...)
 	if err != nil {
 		return nil, err
 	}
@@ -227,64 +259,64 @@ func (s *Store) ListInterfaces(node string) ([]Interface, error) {
 }
 
 // DeleteInterface removes an interface (and its peers, via cascade).
-func (s *Store) DeleteInterface(node, name string) error {
-	res, err := s.db.Exec("DELETE FROM interfaces WHERE node = ? AND name = ?", node, name)
+func (s *Store) DeleteInterface(client, name string) error {
+	res, err := s.db.Exec("DELETE FROM interfaces WHERE client = ? AND name = ?", client, name)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("%w: interface %q", ErrNotFound, name)
 	}
-	// Deleting the top-version interface lowers the node's MAX version —
+	// Deleting the top-version interface lowers the client's MAX version —
 	// still a config change agents must see.
-	s.changed(node)
+	s.changed(client)
 	return nil
 }
 
 // SetEnabled toggles an interface and bumps its config version so agents
 // pick the change up on their next poll.
-func (s *Store) SetEnabled(node, name string, enabled bool) error {
-	if err := s.bumpIf("UPDATE interfaces SET enabled = ?, config_version = config_version + 1 WHERE node = ? AND name = ?", enabled, node, name); err != nil {
+func (s *Store) SetEnabled(client, name string, enabled bool) error {
+	if err := s.bumpIf("UPDATE interfaces SET enabled = ?, config_version = config_version + 1 WHERE client = ? AND name = ?", enabled, client, name); err != nil {
 		return err
 	}
-	s.changed(node)
+	s.changed(client)
 	return nil
 }
 
 // UpdateServerEndpoint sets the public endpoint advertised in client confs.
-func (s *Store) UpdateServerEndpoint(node, name, endpoint string) error {
-	_, err := s.db.Exec("UPDATE interfaces SET server_endpoint = ?, config_version = config_version + 1 WHERE node = ? AND name = ?", endpoint, node, name)
+func (s *Store) UpdateServerEndpoint(client, name, endpoint string) error {
+	_, err := s.db.Exec("UPDATE interfaces SET server_endpoint = ?, config_version = config_version + 1 WHERE client = ? AND name = ?", endpoint, client, name)
 	if err != nil {
 		return err
 	}
-	s.changed(node)
+	s.changed(client)
 	return nil
 }
 
 // AddPeer inserts a peer for the given interface.
 func (s *Store) AddPeer(p *Peer) error {
 	res, err := s.db.Exec(`INSERT INTO peers
-		(node, interface, name, public_key, client_private_key, preshared_key, allowed_ips, endpoint, keepalive)
+		(client, interface, name, public_key, client_private_key, preshared_key, allowed_ips, endpoint, keepalive)
 		VALUES (?,?,?,?,?,?,?,?,?)`,
-		p.Node, p.Interface, p.Name, p.PublicKey, p.ClientPrivateKey, p.PresharedKey, p.AllowedIPs, p.Endpoint, p.Keepalive)
+		p.Client, p.Interface, p.Name, p.PublicKey, p.ClientPrivateKey, p.PresharedKey, p.AllowedIPs, p.Endpoint, p.Keepalive)
 	if err != nil {
 		return err
 	}
 	p.ID, _ = res.LastInsertId()
-	if err := s.bump(p.Node, p.Interface); err != nil {
+	if err := s.bump(p.Client, p.Interface); err != nil {
 		return err
 	}
-	s.changed(p.Node)
+	s.changed(p.Client)
 	return nil
 }
 
 // ListPeers returns the peers of an interface (of all interfaces if name is empty).
-func (s *Store) ListPeers(node, iface string) ([]Peer, error) {
+func (s *Store) ListPeers(client, iface string) ([]Peer, error) {
 	q := `SELECT ` + peerCols + ` FROM peers WHERE 1=1`
 	var args []any
-	if node != "*" {
-		q += ` AND node = ?`
-		args = append(args, node)
+	if client != "*" {
+		q += ` AND client = ?`
+		args = append(args, client)
 	}
 	if iface != "" {
 		q += ` AND interface = ?`
@@ -298,7 +330,7 @@ func (s *Store) ListPeers(node, iface string) ([]Peer, error) {
 	var out []Peer
 	for rows.Next() {
 		var p Peer
-		if err := rows.Scan(&p.ID, &p.Node, &p.Interface, &p.Name, &p.PublicKey, &p.ClientPrivateKey, &p.PresharedKey, &p.AllowedIPs, &p.Endpoint, &p.Keepalive); err != nil {
+		if err := rows.Scan(&p.ID, &p.Client, &p.Interface, &p.Name, &p.PublicKey, &p.ClientPrivateKey, &p.PresharedKey, &p.AllowedIPs, &p.Endpoint, &p.Keepalive); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -307,8 +339,8 @@ func (s *Store) ListPeers(node, iface string) ([]Peer, error) {
 }
 
 // GetPeer returns a peer of iface by name, public key, or numeric ID.
-func (s *Store) GetPeer(node, iface, ref string) (*Peer, error) {
-	peers, err := s.ListPeers(node, iface)
+func (s *Store) GetPeer(client, iface, ref string) (*Peer, error) {
+	peers, err := s.ListPeers(client, iface)
 	if err != nil {
 		return nil, err
 	}
@@ -322,54 +354,54 @@ func (s *Store) GetPeer(node, iface, ref string) (*Peer, error) {
 }
 
 // DeletePeer removes a peer of iface by name, public key, or numeric ID.
-func (s *Store) DeletePeer(node, iface, ref string) (*Peer, error) {
-	p, err := s.GetPeer(node, iface, ref)
+func (s *Store) DeletePeer(client, iface, ref string) (*Peer, error) {
+	p, err := s.GetPeer(client, iface, ref)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := s.db.Exec("DELETE FROM peers WHERE id = ?", p.ID); err != nil {
 		return nil, err
 	}
-	if err := s.bump(node, iface); err != nil {
+	if err := s.bump(client, iface); err != nil {
 		return nil, err
 	}
-	s.changed(node)
+	s.changed(client)
 	return p, nil
 }
 
-// ConfigVersion returns the max config version of a node's interfaces
-// (0 when the node has none) — the number agents poll with.
-func (s *Store) ConfigVersion(node string) (int64, error) {
+// ConfigVersion returns the max config version of a client's interfaces
+// (0 when the client has none) — the number agents poll with.
+func (s *Store) ConfigVersion(client string) (int64, error) {
 	var v sql.NullInt64
-	err := s.db.QueryRow("SELECT MAX(config_version) FROM interfaces WHERE node = ?", node).Scan(&v)
+	err := s.db.QueryRow("SELECT MAX(config_version) FROM interfaces WHERE client = ?", client).Scan(&v)
 	return v.Int64, err
 }
 
-// --- node registry ---
+// --- client registry ---
 
-// EnsureNode registers a node (or refreshes its certificate fingerprint).
-func (s *Store) EnsureNode(name, fingerprint string) error {
-	_, err := s.db.Exec(`INSERT INTO nodes (name, fingerprint) VALUES (?, ?)
+// EnsureClient registers a client (or refreshes its certificate fingerprint).
+func (s *Store) EnsureClient(name, fingerprint string) error {
+	_, err := s.db.Exec(`INSERT INTO clients (name, fingerprint) VALUES (?, ?)
 		ON CONFLICT(name) DO UPDATE SET fingerprint = excluded.fingerprint`, name, fingerprint)
 	return err
 }
 
-// TouchNode records the last time a node polled.
-func (s *Store) TouchNode(name, when string) error {
-	_, err := s.db.Exec("UPDATE nodes SET last_seen = ? WHERE name = ?", when, name)
+// TouchClient records the last time a client polled.
+func (s *Store) TouchClient(name, when string) error {
+	_, err := s.db.Exec("UPDATE clients SET last_seen = ? WHERE name = ?", when, name)
 	return err
 }
 
-// ListNodes returns all registered nodes.
-func (s *Store) ListNodes() ([]Node, error) {
-	rows, err := s.db.Query("SELECT name, fingerprint, last_seen FROM nodes ORDER BY name")
+// ListClients returns all registered clients.
+func (s *Store) ListClients() ([]Client, error) {
+	rows, err := s.db.Query("SELECT name, fingerprint, last_seen FROM clients ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Node
+	var out []Client
 	for rows.Next() {
-		var n Node
+		var n Client
 		if err := rows.Scan(&n.Name, &n.Fingerprint, &n.LastSeen); err != nil {
 			return nil, err
 		}
@@ -378,31 +410,31 @@ func (s *Store) ListNodes() ([]Node, error) {
 	return out, rows.Err()
 }
 
-// GetNode returns a registered node by name.
-func (s *Store) GetNode(name string) (*Node, error) {
-	var n Node
-	err := s.db.QueryRow("SELECT name, fingerprint, last_seen FROM nodes WHERE name = ?", name).
+// GetClient returns a registered client by name.
+func (s *Store) GetClient(name string) (*Client, error) {
+	var n Client
+	err := s.db.QueryRow("SELECT name, fingerprint, last_seen FROM clients WHERE name = ?", name).
 		Scan(&n.Name, &n.Fingerprint, &n.LastSeen)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("%w: node %q", ErrNotFound, name)
+		return nil, fmt.Errorf("%w: client %q", ErrNotFound, name)
 	}
 	return &n, err
 }
 
-// DeleteNode removes a node and everything it owns: interfaces (peers go
+// DeleteClient removes a client and everything it owns: interfaces (peers go
 // with them via cascade), enrollment tokens, and the registry row. An
-// enrolled agent discovers this on its next poll (auth fails, node unknown)
+// enrolled agent discovers this on its next poll (auth fails, client unknown)
 // and rolls itself back via its verify-timeout dead-man switch.
-func (s *Store) DeleteNode(name string) error {
+func (s *Store) DeleteClient(name string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	for _, q := range []string{
-		"DELETE FROM interfaces WHERE node = ?", // peers cascade
-		"DELETE FROM enroll_tokens WHERE node = ?",
-		"DELETE FROM nodes WHERE name = ?",
+		"DELETE FROM interfaces WHERE client = ?", // peers cascade
+		"DELETE FROM enroll_tokens WHERE client = ?",
+		"DELETE FROM clients WHERE name = ?",
 	} {
 		if _, err := tx.Exec(q, name); err != nil {
 			return err
@@ -418,17 +450,17 @@ var ifaceNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,15}$`)
 
 func ValidIfaceName(name string) bool { return ifaceNameRe.MatchString(name) }
 
-// ValidNodeName reports whether name is a safe node name: it ends up in
+// ValidClientName reports whether name is a safe client name: it ends up in
 // URLs and certificate CNs, so it must stay conservative.
-var nodeNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
+var clientNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
 
-func ValidNodeName(name string) bool { return nodeNameRe.MatchString(name) }
+func ValidClientName(name string) bool { return clientNameRe.MatchString(name) }
 
-// EnsureNodePending registers a node row without touching an existing
-// fingerprint (unlike EnsureNode, which overwrites it) — used when minting
-// an enrollment token so the dashboard can show the pending node.
-func (s *Store) EnsureNodePending(name string) error {
-	_, err := s.db.Exec("INSERT INTO nodes (name, fingerprint) VALUES (?, '') ON CONFLICT(name) DO NOTHING", name)
+// EnsureClientPending registers a client row without touching an existing
+// fingerprint (unlike EnsureClient, which overwrites it) — used when minting
+// an enrollment token so the dashboard can show the pending client.
+func (s *Store) EnsureClientPending(name string) error {
+	_, err := s.db.Exec("INSERT INTO clients (name, fingerprint) VALUES (?, '') ON CONFLICT(name) DO NOTHING", name)
 	return err
 }
 
@@ -437,15 +469,15 @@ func (s *Store) EnsureNodePending(name string) error {
 // EnrollToken is a one-time bootstrap token record. Only the hash is
 // stored; the plaintext exists solely at creation time.
 type EnrollToken struct {
-	Node      string
+	Client      string
 	CreatedAt string
 	ExpiresAt string
 	Used      bool
 }
 
-// CreateEnrollToken mints a one-time token for node, valid for ttl, and
+// CreateEnrollToken mints a one-time token for client, valid for ttl, and
 // piggybacks deletion of long-expired rows. Returns the plaintext token.
-func (s *Store) CreateEnrollToken(node string, ttl time.Duration) (string, error) {
+func (s *Store) CreateEnrollToken(client string, ttl time.Duration) (string, error) {
 	raw := make([]byte, 24)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
@@ -453,8 +485,8 @@ func (s *Store) CreateEnrollToken(node string, ttl time.Duration) (string, error
 	token := hex.EncodeToString(raw)
 	sum := sha256.Sum256([]byte(token))
 	now := time.Now().UTC()
-	_, err := s.db.Exec(`INSERT INTO enroll_tokens (token_hash, node, created_at, expires_at) VALUES (?,?,?,?)`,
-		fmt.Sprintf("%x", sum), node, now.Format(time.RFC3339), now.Add(ttl).Format(time.RFC3339))
+	_, err := s.db.Exec(`INSERT INTO enroll_tokens (token_hash, client, created_at, expires_at) VALUES (?,?,?,?)`,
+		fmt.Sprintf("%x", sum), client, now.Format(time.RFC3339), now.Add(ttl).Format(time.RFC3339))
 	if err != nil {
 		return "", err
 	}
@@ -463,7 +495,7 @@ func (s *Store) CreateEnrollToken(node string, ttl time.Duration) (string, error
 	return token, nil
 }
 
-// RedeemEnrollToken atomically burns a token and returns its node.
+// RedeemEnrollToken atomically burns a token and returns its client.
 // ErrNotFound covers unknown, expired, and already-used — deliberately
 // indistinguishable to callers.
 func (s *Store) RedeemEnrollToken(token string) (string, error) {
@@ -477,21 +509,21 @@ func (s *Store) RedeemEnrollToken(token string) (string, error) {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return "", fmt.Errorf("%w: enroll token", ErrNotFound)
 	}
-	var node string
-	if err := s.db.QueryRow("SELECT node FROM enroll_tokens WHERE token_hash = ?", fmt.Sprintf("%x", sum)).Scan(&node); err != nil {
+	var client string
+	if err := s.db.QueryRow("SELECT client FROM enroll_tokens WHERE token_hash = ?", fmt.Sprintf("%x", sum)).Scan(&client); err != nil {
 		return "", err
 	}
-	return node, nil
+	return client, nil
 }
 
 // ListEnrollTokens returns outstanding (unused, unexpired) tokens,
-// optionally limited to one node ("" = all nodes).
-func (s *Store) ListEnrollTokens(node string) ([]EnrollToken, error) {
-	q := "SELECT node, created_at, expires_at FROM enroll_tokens WHERE used_at = '' AND expires_at > ?"
+// optionally limited to one client ("" = all clients).
+func (s *Store) ListEnrollTokens(client string) ([]EnrollToken, error) {
+	q := "SELECT client, created_at, expires_at FROM enroll_tokens WHERE used_at = '' AND expires_at > ?"
 	args := []any{time.Now().UTC().Format(time.RFC3339)}
-	if node != "" {
-		q += " AND node = ?"
-		args = append(args, node)
+	if client != "" {
+		q += " AND client = ?"
+		args = append(args, client)
 	}
 	q += " ORDER BY created_at"
 	rows, err := s.db.Query(q, args...)
@@ -502,7 +534,7 @@ func (s *Store) ListEnrollTokens(node string) ([]EnrollToken, error) {
 	var out []EnrollToken
 	for rows.Next() {
 		var t EnrollToken
-		if err := rows.Scan(&t.Node, &t.CreatedAt, &t.ExpiresAt); err != nil {
+		if err := rows.Scan(&t.Client, &t.CreatedAt, &t.ExpiresAt); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -510,32 +542,32 @@ func (s *Store) ListEnrollTokens(node string) ([]EnrollToken, error) {
 	return out, rows.Err()
 }
 
-// DeleteEnrollTokens revokes all outstanding tokens of a node.
-func (s *Store) DeleteEnrollTokens(node string) error {
-	_, err := s.db.Exec("DELETE FROM enroll_tokens WHERE node = ? AND used_at = ''", node)
+// DeleteEnrollTokens revokes all outstanding tokens of a client.
+func (s *Store) DeleteEnrollTokens(client string) error {
+	_, err := s.db.Exec("DELETE FROM enroll_tokens WHERE client = ? AND used_at = ''", client)
 	return err
 }
 
 // --- internals ---
 
-func whereNode(node string) string {
-	if node == "" {
+func whereClient(client string) string {
+	if client == "" {
 		return ""
 	}
-	return " WHERE node = ?"
+	return " WHERE client = ?"
 }
 
-func nodeArgs(node string) []any {
-	if node == "" {
+func clientArgs(client string) []any {
+	if client == "" {
 		return nil
 	}
-	return []any{node}
+	return []any{client}
 }
 
 // bump increments the config version of an interface after any change,
 // so agents detect updates and conf regeneration can be ordered.
-func (s *Store) bump(node, iface string) error {
-	return s.bumpIf("UPDATE interfaces SET config_version = config_version + 1 WHERE node = ? AND name = ?", node, iface)
+func (s *Store) bump(client, iface string) error {
+	return s.bumpIf("UPDATE interfaces SET config_version = config_version + 1 WHERE client = ? AND name = ?", client, iface)
 }
 
 func (s *Store) bumpIf(q string, args ...any) error {

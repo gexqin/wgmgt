@@ -1,5 +1,5 @@
 // Package agent implements the wgmgt agent: a stateless pull loop that
-// fetches its node's desired config from the controller over mTLS, applies
+// fetches its client's desired config from the controller over mTLS, applies
 // it via netlink, and reports live status back with each poll. The agent's
 // only local state is its certificate and the generated conf files.
 package agent
@@ -36,7 +36,7 @@ type Agent struct {
 
 	// Dead-man switch: after applying a config, the agent must reach the
 	// controller again within verifyTimeout. If it cannot (a full-tunnel
-	// route locked the node out, say), it tears its WireGuard down and
+	// route locked the client out, say), it tears its WireGuard down and
 	// refuses to re-apply that config version (quarantine) — the operator
 	// fixes the config, the version bumps, and the agent tries again.
 	verifyTimeout  time.Duration
@@ -64,7 +64,7 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeou
 		client: &http.Client{
 			// No blanket Timeout: it would abort held long-poll responses.
 			// Instead the phases are bounded individually — dial/handshake
-			// timeouts keep a black-holed (locked-out) node failing in ~10s
+			// timeouts keep a black-holed (locked-out) client failing in ~10s
 			// so the Run loop keeps scheduling the watchdog, and the header
 			// timeout bounds a silent controller for everyone else. The
 			// server's --poll-hold must stay below it.
@@ -92,7 +92,7 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeou
 // long-poll blocks for the server's hold time, so the request itself is the
 // sleep — the agent reconnects instantly, and config changes reach it in
 // milliseconds. The watchdog runs on a short side ticker so a locked-out
-// node still fires on time even while polls fail or back off.
+// client still fires on time even while polls fail or back off.
 func (a *Agent) Run(ctx context.Context) error {
 	watch := time.NewTicker(5 * time.Second)
 	defer watch.Stop()
@@ -159,7 +159,7 @@ func (a *Agent) checkWatchdog() {
 	a.verifying = false
 }
 
-// Quarantine survives restarts (a locked-out-then-rebooted node must not
+// Quarantine survives restarts (a locked-out-then-rebooted client must not
 // reapply the same broken config), so it lives in the conf dir.
 func (a *Agent) quarantinePath() string { return filepath.Join(a.confDir, ".quarantine") }
 
@@ -204,7 +204,7 @@ func (a *Agent) teardown() {
 
 // PollOnce fetches new config (if any), applies it, and reports status.
 // A successful poll also confirms the previously applied config (contact
-// with the controller proves the node is not locked out).
+// with the controller proves the client is not locked out).
 func (a *Agent) PollOnce(ctx context.Context) error {
 	a.gotConfig = false
 	body, _ := json.Marshal(control.PollRequest{Since: a.appliedVer, Status: a.collectStatus()})
@@ -233,7 +233,7 @@ func (a *Agent) PollOnce(ctx context.Context) error {
 		if a.quarantinedVer > 0 && cfg.Version == a.quarantinedVer {
 			// The config that locked us out is still current; stay down.
 			// Exactly equal, not <=: versions can drop (deleting the
-			// top-version interface lowers the node's MAX), and a fixed
+			// top-version interface lowers the client's MAX), and a fixed
 			// config must be allowed to carry a lower number.
 			a.appliedVer = cfg.Version
 		} else if err := a.Apply(*cfg.Interfaces); err != nil {
@@ -271,7 +271,7 @@ func sigOf(ci control.AgentInterface) ifaceSig {
 	return ifaceSig{addr: ci.Address, port: ci.ListenPort, mtu: ci.MTU, policy: v4 || v6}
 }
 
-// Apply converges the node to the desired state: enabled interfaces up
+// Apply converges the client to the desired state: enabled interfaces up
 // with the right peers, disabled interfaces down, conf files written.
 // Peer-only changes hot-apply; routing-signature changes (address, port,
 // MTU, default-route on/off) rebuild the device.

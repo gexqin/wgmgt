@@ -1,6 +1,6 @@
 // Package app hosts orchestration shared by the CLI and the web UI:
 // regenerating conf files, hot-applying peers, assigning addresses.
-// It operates on a single node's interfaces (node "" = this host).
+// It operates on a single client's interfaces (client "" = this host).
 package app
 
 import (
@@ -23,7 +23,7 @@ type App struct {
 
 // SyncConf regenerates the wg-quick conf for a local interface after a
 // change and hot-applies the peer list if the device is currently up.
-// (Remote-node interfaces are applied by their agent, not here.)
+// (Remote-client interfaces are applied by their agent, not here.)
 func (a *App) SyncConf(name string) error {
 	ifc, err := a.Store.GetInterface("", name)
 	if err != nil {
@@ -59,7 +59,7 @@ func (a *App) NextFreeIP(ifc *store.Interface) (string, error) {
 	if !addr.Is4() {
 		return "", fmt.Errorf("automatic IP assignment needs an IPv4 tunnel")
 	}
-	peers, err := a.Store.ListPeers(ifc.Node, ifc.Name)
+	peers, err := a.Store.ListPeers(ifc.Client, ifc.Name)
 	if err != nil {
 		return "", err
 	}

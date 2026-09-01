@@ -4,8 +4,8 @@
 // random scanners and browser-side CSRF/DNS-rebinding against localhost.
 //
 // Two modes: local (single host, drives netlink directly) and controller
-// (wgmgt server; interfaces belong to nodes, live status comes from agent
-// reports, up/down toggles the node's desired state).
+// (wgmgt server; interfaces belong to clients, live status comes from agent
+// reports, up/down toggles the client's desired state).
 package web
 
 import (
@@ -110,7 +110,7 @@ func (s *Server) url(elem ...string) string {
 // ifaceURL builds the URL of an interface page (and sub-paths) in either mode.
 func (s *Server) ifaceURL(ifc store.Interface, rest ...string) string {
 	if s.controller {
-		return s.url(append([]string{"node", ifc.Node, "iface", ifc.Name}, rest...)...)
+		return s.url(append([]string{"client", ifc.Client, "iface", ifc.Name}, rest...)...)
 	}
 	return s.url(append([]string{"iface", ifc.Name}, rest...)...)
 }
@@ -137,20 +137,20 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /static/", s.handleStatic)
 	if s.controller {
 		s.mux.HandleFunc("GET /{$}", s.handleDashboard)
-		s.mux.HandleFunc("POST /nodes", s.handleNodeAdd)
+		s.mux.HandleFunc("POST /clients", s.handleClientAdd)
 		s.mux.HandleFunc("GET /enroll/{id}", s.handleEnrollShow)
-		s.mux.HandleFunc("GET /node/{node}", s.handleNode)
-		s.mux.HandleFunc("POST /node/{node}/token", s.handleNodeToken)
-		s.mux.HandleFunc("POST /node/{node}/rm", s.handleNodeRm)
-		s.mux.HandleFunc("POST /node/{node}/peers", s.handlePeerQuickAdd)
-		s.mux.HandleFunc("POST /node/{node}/ifaces", s.handleIfaceCreate)
-		s.mux.HandleFunc("GET /node/{node}/iface/{name}", s.handleIface)
-		s.mux.HandleFunc("GET /node/{node}/iface/{name}/peers-table", s.handlePeersTable)
-		s.mux.HandleFunc("GET /node/{node}/iface/{name}/peers/{ref}/conf", s.handlePeerConf)
-		s.mux.HandleFunc("POST /node/{node}/iface/{name}/up", s.handleUp)
-		s.mux.HandleFunc("POST /node/{node}/iface/{name}/down", s.handleDown)
-		s.mux.HandleFunc("POST /node/{node}/iface/{name}/peers", s.handlePeerAdd)
-		s.mux.HandleFunc("POST /node/{node}/iface/{name}/peers/{ref}/rm", s.handlePeerRm)
+		s.mux.HandleFunc("GET /client/{client}", s.handleClient)
+		s.mux.HandleFunc("POST /client/{client}/token", s.handleClientToken)
+		s.mux.HandleFunc("POST /client/{client}/rm", s.handleClientRm)
+		s.mux.HandleFunc("POST /client/{client}/peers", s.handlePeerQuickAdd)
+		s.mux.HandleFunc("POST /client/{client}/ifaces", s.handleIfaceCreate)
+		s.mux.HandleFunc("GET /client/{client}/iface/{name}", s.handleIface)
+		s.mux.HandleFunc("GET /client/{client}/iface/{name}/peers-table", s.handlePeersTable)
+		s.mux.HandleFunc("GET /client/{client}/iface/{name}/peers/{ref}/conf", s.handlePeerConf)
+		s.mux.HandleFunc("POST /client/{client}/iface/{name}/up", s.handleUp)
+		s.mux.HandleFunc("POST /client/{client}/iface/{name}/down", s.handleDown)
+		s.mux.HandleFunc("POST /client/{client}/iface/{name}/peers", s.handlePeerAdd)
+		s.mux.HandleFunc("POST /client/{client}/iface/{name}/peers/{ref}/rm", s.handlePeerRm)
 		return
 	}
 	s.mux.HandleFunc("GET /{$}", s.handleDashboard)
@@ -188,7 +188,7 @@ func (s *Server) parseTemplates() error {
 		return err
 	}
 	s.pages = map[string]*template.Template{}
-	pages := []string{"dashboard.html", "iface.html", "peerconf.html", "error.html", "node.html", "enroll.html"}
+	pages := []string{"dashboard.html", "iface.html", "peerconf.html", "error.html", "client.html", "enroll.html"}
 	for _, page := range pages {
 		t, err := template.Must(base.Clone()).ParseFS(files, "templates/"+page, "templates/peers.html")
 		if err != nil {
@@ -226,7 +226,7 @@ type cardView struct {
 	Peers   int
 }
 
-type nodeCard struct {
+type clientCard struct {
 	Name        string
 	LastSeen    string // humanized, "" if never
 	Online      bool
@@ -237,7 +237,7 @@ type nodeCard struct {
 // liveStatus resolves the live state of an interface in either mode.
 func (s *Server) liveStatus(ifc *store.Interface) (bool, map[string]wgctl.PeerStatus) {
 	if s.controller {
-		rep := s.reports.Get(ifc.Node)
+		rep := s.reports.Get(ifc.Client)
 		for _, ir := range rep.Report.Interfaces {
 			if ir.Name != ifc.Name {
 				continue
@@ -263,12 +263,12 @@ func (s *Server) liveStatus(ifc *store.Interface) (bool, map[string]wgctl.PeerSt
 	return true, live
 }
 
-func (s *Server) viewOf(node, name string) (ifaceView, error) {
-	ifc, err := s.app.Store.GetInterface(node, name)
+func (s *Server) viewOf(client, name string) (ifaceView, error) {
+	ifc, err := s.app.Store.GetInterface(client, name)
 	if err != nil {
 		return ifaceView{}, err
 	}
-	peers, err := s.app.Store.ListPeers(ifc.Node, ifc.Name)
+	peers, err := s.app.Store.ListPeers(ifc.Client, ifc.Name)
 	if err != nil {
 		return ifaceView{}, err
 	}
@@ -296,23 +296,23 @@ func (s *Server) viewOf(node, name string) (ifaceView, error) {
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if s.controller {
-		nodes, err := s.app.Store.ListNodes()
+		clients, err := s.app.Store.ListClients()
 		if err != nil {
 			s.serverError(w, err)
 			return
 		}
-		ifaces, err := s.app.Store.ListInterfaces("") // "" = all nodes
+		ifaces, err := s.app.Store.ListInterfaces("") // "" = all clients
 		if err != nil {
 			s.serverError(w, err)
 			return
 		}
 		counts := map[string]int{}
 		for _, ifc := range ifaces {
-			counts[ifc.Node]++
+			counts[ifc.Client]++
 		}
-		cards := make([]nodeCard, 0, len(nodes))
-		for _, n := range nodes {
-			c := nodeCard{Name: n.Name, Interfaces: counts[n.Name]}
+		cards := make([]clientCard, 0, len(clients))
+		for _, n := range clients {
+			c := clientCard{Name: n.Name, Interfaces: counts[n.Name]}
 			if entry := s.reports.Get(n.Name); !entry.When.IsZero() {
 				age := time.Since(entry.When)
 				c.LastSeen = humanize.Duration(age)
@@ -323,7 +323,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		s.render(w, http.StatusOK, "dashboard.html", struct {
 			Controller bool
-			Nodes      []nodeCard
+			Clients      []clientCard
 		}{true, cards})
 		return
 	}
@@ -348,70 +348,70 @@ const enrollTokenTTL = 24 * time.Hour
 
 // enrollView is a freshly minted join command, shown exactly once.
 type enrollView struct {
-	Node    string
+	Client    string
 	Token   string
 	Command string
 	Expires time.Time
 }
 
-// handleNodeAdd is controller-only: the "Add node" form mints a one-time
+// handleClientAdd is controller-only: the "Add client" form mints a one-time
 // enrollment token and redirects to a page showing the join command.
-func (s *Server) handleNodeAdd(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleClientAdd(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		s.badRequest(w, "bad form")
 		return
 	}
 	name := strings.TrimSpace(r.PostFormValue("name"))
 	if name == "" {
-		s.badRequest(w, "node name is required")
+		s.badRequest(w, "client name is required")
 		return
 	}
-	// Node names become URL paths and certificate CNs — keep them strict.
-	if !store.ValidNodeName(name) {
-		s.badRequest(w, "invalid node name (max 64 chars, starts with [a-zA-Z0-9], then [a-zA-Z0-9_.-])")
+	// Client names become URL paths and certificate CNs — keep them strict.
+	if !store.ValidClientName(name) {
+		s.badRequest(w, "invalid client name (max 64 chars, starts with [a-zA-Z0-9], then [a-zA-Z0-9_.-])")
 		return
 	}
-	if err := s.app.Store.EnsureNodePending(name); err != nil {
+	if err := s.app.Store.EnsureClientPending(name); err != nil {
 		s.serverError(w, err)
 		return
 	}
 	s.mintEnrollToken(w, r, name)
 }
 
-// handleNodeToken re-mints an existing node's enrollment token: the old
-// outstanding token (if any) is revoked, so each node has at most one live
-// token. Re-minting for an enrolled node is the re-enrollment path — the
+// handleClientToken re-mints an existing client's enrollment token: the old
+// outstanding token (if any) is revoked, so each client has at most one live
+// token. Re-minting for an enrolled client is the re-enrollment path — the
 // new certificate supersedes the old one via the fingerprint check.
-func (s *Server) handleNodeToken(w http.ResponseWriter, r *http.Request) {
-	node := r.PathValue("node")
-	if _, err := s.app.Store.GetNode(node); err != nil {
+func (s *Server) handleClientToken(w http.ResponseWriter, r *http.Request) {
+	client := r.PathValue("client")
+	if _, err := s.app.Store.GetClient(client); err != nil {
 		s.notFoundOrError(w, err)
 		return
 	}
-	if err := s.app.Store.DeleteEnrollTokens(node); err != nil {
+	if err := s.app.Store.DeleteEnrollTokens(client); err != nil {
 		s.serverError(w, err)
 		return
 	}
-	s.mintEnrollToken(w, r, node)
+	s.mintEnrollToken(w, r, client)
 }
 
-// handleNodeRm is controller-only: deletes the node and everything it owns
+// handleClientRm is controller-only: deletes the client and everything it owns
 // (interfaces, peers, tokens). An enrolled agent fails auth on its next
 // poll and its dead-man switch rolls WireGuard back — no agent-side action
 // needed.
-func (s *Server) handleNodeRm(w http.ResponseWriter, r *http.Request) {
-	node := r.PathValue("node")
-	if err := s.app.Store.DeleteNode(node); err != nil {
+func (s *Server) handleClientRm(w http.ResponseWriter, r *http.Request) {
+	client := r.PathValue("client")
+	if err := s.app.Store.DeleteClient(client); err != nil {
 		s.serverError(w, err)
 		return
 	}
 	http.Redirect(w, r, s.url(), http.StatusSeeOther)
 }
 
-// mintEnrollToken creates a one-time token for node and redirects to the
+// mintEnrollToken creates a one-time token for client and redirects to the
 // page that shows the join command exactly once.
-func (s *Server) mintEnrollToken(w http.ResponseWriter, r *http.Request, node string) {
-	token, err := s.app.Store.CreateEnrollToken(node, enrollTokenTTL)
+func (s *Server) mintEnrollToken(w http.ResponseWriter, r *http.Request, client string) {
+	token, err := s.app.Store.CreateEnrollToken(client, enrollTokenTTL)
 	if err != nil {
 		s.serverError(w, err)
 		return
@@ -422,7 +422,7 @@ func (s *Server) mintEnrollToken(w http.ResponseWriter, r *http.Request, node st
 		return
 	}
 	view := enrollView{
-		Node:    node,
+		Client:    client,
 		Token:   token,
 		Command: fmt.Sprintf("sudo wgmgt agent --server %s --token %s --ca-hash sha256:%s", s.apiURL, token, s.caHash),
 		Expires: time.Now().Add(enrollTokenTTL),
@@ -449,43 +449,43 @@ func (s *Server) handleEnrollShow(w http.ResponseWriter, r *http.Request) {
 	s.render(w, http.StatusOK, "enroll.html", view)
 }
 
-func (s *Server) handleNode(w http.ResponseWriter, r *http.Request) {
-	node := r.PathValue("node")
-	ifaces, err := s.app.Store.ListInterfaces(node)
+func (s *Server) handleClient(w http.ResponseWriter, r *http.Request) {
+	client := r.PathValue("client")
+	ifaces, err := s.app.Store.ListInterfaces(client)
 	if err != nil {
 		s.serverError(w, err)
 		return
 	}
-	type nodeIface struct {
+	type clientIface struct {
 		store.Interface
 		ReportedUp bool
 		PeerCount  int
 	}
-	list := make([]nodeIface, 0, len(ifaces))
+	list := make([]clientIface, 0, len(ifaces))
 	for _, ifc := range ifaces {
-		peers, _ := s.app.Store.ListPeers(node, ifc.Name)
+		peers, _ := s.app.Store.ListPeers(client, ifc.Name)
 		up, _ := s.liveStatus(&ifc)
-		list = append(list, nodeIface{Interface: ifc, ReportedUp: up, PeerCount: len(peers)})
+		list = append(list, clientIface{Interface: ifc, ReportedUp: up, PeerCount: len(peers)})
 	}
 	// Enrollment state for the token section: enrolled (fingerprint set) or
 	// still pending, plus the outstanding token's expiry if one exists.
 	enrolled := false
 	var tokenExpiry string
-	if n, err := s.app.Store.GetNode(node); err == nil {
+	if n, err := s.app.Store.GetClient(client); err == nil {
 		enrolled = n.Fingerprint != ""
 	}
-	if toks, err := s.app.Store.ListEnrollTokens(node); err == nil && len(toks) > 0 {
+	if toks, err := s.app.Store.ListEnrollTokens(client); err == nil && len(toks) > 0 {
 		tokenExpiry = toks[0].ExpiresAt
 	}
-	s.render(w, http.StatusOK, "node.html", struct {
-		Node        string
-		Interfaces  []nodeIface
+	s.render(w, http.StatusOK, "client.html", struct {
+		Client        string
+		Interfaces  []clientIface
 		Enrolled    bool
 		TokenExpiry string
-	}{node, list, enrolled, tokenExpiry})
+	}{client, list, enrolled, tokenExpiry})
 }
 
-// handlePeerQuickAdd is controller-only: the node page's quick-add form.
+// handlePeerQuickAdd is controller-only: the client page's quick-add form.
 // It resolves the chosen interface from the form and forwards to the
 // regular peer-add handler.
 func (s *Server) handlePeerQuickAdd(w http.ResponseWriter, r *http.Request) {
@@ -503,9 +503,9 @@ func (s *Server) handlePeerQuickAdd(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleIfaceCreate is controller-only: the wizard form for adding an
-// interface to a node.
+// interface to a client.
 func (s *Server) handleIfaceCreate(w http.ResponseWriter, r *http.Request) {
-	node := r.PathValue("node")
+	client := r.PathValue("client")
 	if err := r.ParseForm(); err != nil {
 		s.badRequest(w, "bad form")
 		return
@@ -537,7 +537,7 @@ func (s *Server) handleIfaceCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	mtu, _ := strconv.Atoi(r.PostFormValue("mtu"))
 	ifc := &store.Interface{
-		Node: node, Name: name, PrivateKey: key.String(),
+		Client: client, Name: name, PrivateKey: key.String(),
 		Address: address, ListenPort: port, MTU: mtu, Enabled: true,
 	}
 	if err := s.app.Store.CreateInterface(ifc); err != nil {
@@ -548,7 +548,7 @@ func (s *Server) handleIfaceCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIface(w http.ResponseWriter, r *http.Request) {
-	v, err := s.viewOf(r.PathValue("node"), r.PathValue("name"))
+	v, err := s.viewOf(r.PathValue("client"), r.PathValue("name"))
 	if errors.Is(err, store.ErrNotFound) {
 		s.render(w, http.StatusNotFound, "error.html", errorView{Code: 404, Message: "no such interface"})
 		return
@@ -562,7 +562,7 @@ func (s *Server) handleIface(w http.ResponseWriter, r *http.Request) {
 
 // handlePeersTable returns just the peer rows, polled by htmx every 5s.
 func (s *Server) handlePeersTable(w http.ResponseWriter, r *http.Request) {
-	v, err := s.viewOf(r.PathValue("node"), r.PathValue("name"))
+	v, err := s.viewOf(r.PathValue("client"), r.PathValue("name"))
 	if err != nil {
 		s.serverError(w, err)
 		return
@@ -582,15 +582,15 @@ func (s *Server) handleDown(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpDown(w http.ResponseWriter, r *http.Request, up bool) {
-	node, name := r.PathValue("node"), r.PathValue("name")
-	ifc, err := s.app.Store.GetInterface(node, name)
+	client, name := r.PathValue("client"), r.PathValue("name")
+	ifc, err := s.app.Store.GetInterface(client, name)
 	if err != nil {
 		s.notFoundOrError(w, err)
 		return
 	}
 	if s.controller {
-		// Remote nodes: toggle desired state; the agent converges on poll.
-		if err := s.app.Store.SetEnabled(ifc.Node, ifc.Name, up); err != nil {
+		// Remote clients: toggle desired state; the agent converges on poll.
+		if err := s.app.Store.SetEnabled(ifc.Client, ifc.Name, up); err != nil {
 			s.serverError(w, err)
 			return
 		}
@@ -615,8 +615,8 @@ func (s *Server) handleUpDown(w http.ResponseWriter, r *http.Request, up bool) {
 }
 
 func (s *Server) handlePeerAdd(w http.ResponseWriter, r *http.Request) {
-	node, name := r.PathValue("node"), r.PathValue("name")
-	ifc, err := s.app.Store.GetInterface(node, name)
+	client, name := r.PathValue("client"), r.PathValue("name")
+	ifc, err := s.app.Store.GetInterface(client, name)
 	if err != nil {
 		s.notFoundOrError(w, err)
 		return
@@ -658,7 +658,7 @@ func (s *Server) handlePeerAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p := &store.Peer{
-		Node:       ifc.Node,
+		Client:       ifc.Client,
 		Interface:  ifc.Name,
 		Name:       peerName,
 		AllowedIPs: allowed,
@@ -682,7 +682,7 @@ func (s *Server) handlePeerAdd(w http.ResponseWriter, r *http.Request) {
 		p.PresharedKey = psk.String()
 	}
 	if se := strings.TrimSpace(r.PostFormValue("server_endpoint")); se != "" && se != ifc.ServerEndpoint {
-		if err := s.app.Store.UpdateServerEndpoint(ifc.Node, ifc.Name, se); err != nil {
+		if err := s.app.Store.UpdateServerEndpoint(ifc.Client, ifc.Name, se); err != nil {
 			s.serverError(w, err)
 			return
 		}
@@ -701,8 +701,8 @@ func (s *Server) handlePeerAdd(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePeerRm(w http.ResponseWriter, r *http.Request) {
-	node, name, ref := r.PathValue("node"), r.PathValue("name"), r.PathValue("ref")
-	if _, err := s.app.Store.DeletePeer(node, name, ref); err != nil {
+	client, name, ref := r.PathValue("client"), r.PathValue("name"), r.PathValue("ref")
+	if _, err := s.app.Store.DeletePeer(client, name, ref); err != nil {
 		s.notFoundOrError(w, err)
 		return
 	}
@@ -712,7 +712,7 @@ func (s *Server) handlePeerRm(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ifc, err := s.app.Store.GetInterface(node, name)
+	ifc, err := s.app.Store.GetInterface(client, name)
 	if err != nil {
 		s.notFoundOrError(w, err)
 		return
@@ -721,13 +721,13 @@ func (s *Server) handlePeerRm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePeerConf(w http.ResponseWriter, r *http.Request) {
-	node, name, ref := r.PathValue("node"), r.PathValue("name"), r.PathValue("ref")
-	ifc, err := s.app.Store.GetInterface(node, name)
+	client, name, ref := r.PathValue("client"), r.PathValue("name"), r.PathValue("ref")
+	ifc, err := s.app.Store.GetInterface(client, name)
 	if err != nil {
 		s.notFoundOrError(w, err)
 		return
 	}
-	p, err := s.app.Store.GetPeer(node, name, ref)
+	p, err := s.app.Store.GetPeer(client, name, ref)
 	if err != nil {
 		s.notFoundOrError(w, err)
 		return

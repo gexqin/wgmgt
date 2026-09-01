@@ -45,10 +45,10 @@ sudo wgmgt web                        # embedded web UI (token-protected)
 sudo wgmgt server                     # controller: mTLS agent API + web console
 sudo wgmgt server --web 9090 --web-global   # custom port, listen on all interfaces
 
-# Adding a node — one-time enrollment token (or use the console's
-# "Add node" form, which prints the same join command once):
+# Adding a client — one-time enrollment token (or use the console's
+# "Add client" form, which prints the same join command once):
 sudo wgmgt server token router1
-# On the node: a single command enrolls and starts the agent. The node
+# On the client: a single command enrolls and starts the agent. The client
 # generates its own keypair (the private key never travels) and pins the
 # controller CA via the printed fingerprint.
 sudo wgmgt agent --server https://ctrl:8443 \
@@ -63,14 +63,16 @@ wgmgt doctor                        # check kernel WireGuard compatibility
 ## Status
 
 M3 — single-host CLI loop, embedded web UI, and controller/agent
-multi-node management complete. Nodes join via one-time enrollment tokens
-(agent-generated keys, CA pinning on first contact); agents connect out
-over mTLS and long-poll for their configuration (console changes reach
+multi-client management complete. Clients join via one-time enrollment
+tokens (agent-generated keys, CA pinning on first contact); agents connect
+out over mTLS and long-poll for their configuration (console changes reach
 them in milliseconds; a store-level change hook wakes held polls), apply
 it via netlink, and report live status with each poll cycle; the
-controller web console manages nodes, interfaces, peers, and enrollment
+controller web console manages clients, interfaces, peers, and enrollment
 tokens across the fleet. A dead-man switch rolls agents back out of
-configurations that lock the node away from the controller. Verified
+configurations that lock the client away from the controller. Re-running
+`wgmgt init` on an existing setup offers a full reset (database and
+controller CA wiped, everything regenerates). Verified
 end-to-end with two agents in separate network namespaces building a
 tunnel entirely through the console. See the
 [roadmap](docs/PLAN.md) for what's next (router packages, releases).

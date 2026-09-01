@@ -4,8 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
@@ -31,10 +35,26 @@ var initCmd = &cobra.Command{
 			return errIncompatible
 		}
 		st, err := openStore()
+		if errors.Is(err, store.ErrLegacySchema) {
+			// Pre-rename database: offer the same full reset (resetAll is
+			// disk-driven, so it works without opening the old db).
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "\n%v.\n", err)
+			if !confirm("Delete it (stop running wgmgt processes, remove all managed interfaces and the whole state dir) and re-initialize from scratch?", false) {
+				fmt.Fprintf(out, "Aborted. Remove %s manually, then re-run `wgmgt init`.\n", dbPath)
+				return nil
+			}
+			if err := resetAll(cmd); err != nil {
+				return err
+			}
+			st, err = openStore()
+		}
 		if err != nil {
 			return err
 		}
-		defer st.Close()
+		// Closure, not `defer st.Close()`: the re-init path replaces st with
+		// a fresh store after wiping the old one.
+		defer func() { st.Close() }()
 
 		if err := offerStopForeignWG(cmd, st); err != nil {
 			return err
@@ -48,10 +68,20 @@ var initCmd = &cobra.Command{
 			return fmt.Errorf("invalid interface name %q (max 15 chars, [a-zA-Z0-9_-])", name)
 		}
 		if existing, err := st.GetInterface("", name); err == nil {
-			if err := offerDeleteExisting(cmd, st, existing); err != nil {
-				if errors.Is(err, errKeepExisting) {
-					return nil
-				}
+			keep, err := offerReset(cmd, st, existing)
+			if err != nil {
+				return err
+			}
+			if keep {
+				return nil
+			}
+			// Full reset: wipe devices, conf files, the database and the
+			// controller PKI so everything regenerates from scratch.
+			st.Close()
+			if err := resetAll(cmd); err != nil {
+				return err
+			}
+			if st, err = openStore(); err != nil {
 				return err
 			}
 		} else if !errors.Is(err, store.ErrNotFound) {
@@ -107,24 +137,171 @@ var initCmd = &cobra.Command{
 	},
 }
 
-// offerDeleteExisting is called from init when the chosen name is already
-// managed by wgmgt. The user can delete the old config and re-initialize
-// (init then continues its wizard with a clean slate), or keep it (init
-// exits with next-step hints). Non-interactive runs keep it — same safety
-// default as before, when init simply refused.
-func offerDeleteExisting(cmd *cobra.Command, st *store.Store, ifc *store.Interface) error {
+// offerReset is called from init when the chosen name is already managed
+// by wgmgt. Re-initializing is a FULL reset: every managed interface, the
+// database and the controller state dir are wiped so they regenerate cleanly.
+// The user can keep the existing state instead (init exits with next-step
+// hints). Non-interactive runs keep it — same safety default as before,
+// when init simply refused.
+func offerReset(cmd *cobra.Command, st *store.Store, ifc *store.Interface) (keep bool, err error) {
 	peers, err := st.ListPeers("", ifc.Name)
 	if err != nil {
-		return err
+		return false, err
 	}
 	out := cmd.OutOrStdout()
 	fmt.Fprintf(out, "\nInterface %q is already managed by wgmgt:\n  %s\n", ifc.Name, describeInterface(ifc, len(peers)))
-	if !confirm("Delete it and re-initialize?", false) {
+	if others, err := st.ListInterfaces(""); err == nil && len(others) > 1 {
+		fmt.Fprintf(out, "Also managed (a reset deletes these too):")
+		for _, o := range others {
+			if o.Name != ifc.Name {
+				fmt.Fprintf(out, " %s", o.Name)
+			}
+		}
+		fmt.Fprintln(out)
+	}
+	if !confirm("Delete ALL wgmgt state (stop running wgmgt processes; delete interfaces, peers, databases and the whole state dir) and re-initialize?", false) {
 		fmt.Fprintf(out, "Keeping it. Next: `wgmgt peer add %s` then `sudo wgmgt up %s` (or `wgmgt delete %s` to remove it)\n",
 			ifc.Name, ifc.Name, ifc.Name)
-		return errKeepExisting
+		return true, nil
 	}
-	return removeInterface(cmd, st, ifc)
+	return false, nil
+}
+
+// resetAll wipes everything wgmgt owns on this machine: any running wgmgt
+// processes (server/agent/web hold certificates, the database and the
+// applied config in memory and would keep serving — or re-applying —
+// deleted state), running devices and generated conf files of all managed
+// interfaces, and the whole state directory (databases, controller PKI in
+// <conf-dir>/server) so everything regenerates from scratch. The managed
+// set is taken from the *.conf files in conf-dir — the same definition the
+// agent uses — so this works even when the database cannot be opened
+// (legacy schema). The caller must (re)open the store afterwards.
+func resetAll(cmd *cobra.Command) error {
+	out := cmd.OutOrStdout()
+
+	if stopped, respawned, err := killWgmgtProcs(); err != nil {
+		fmt.Fprintf(cmd.OutOrStderr(), "warning: could not stop running wgmgt processes: %v\n", err)
+	} else {
+		if len(stopped) > 0 {
+			fmt.Fprintf(out, "Stopped wgmgt process(es): %s\n", strings.Join(stopped, ", "))
+		}
+		if len(respawned) > 0 {
+			fmt.Fprintf(cmd.OutOrStderr(), "warning: wgmgt process(es) %s reappeared after being stopped — a service manager (systemd/docker) is restarting them; stop and disable that unit, then re-run `wgmgt init`\n", strings.Join(respawned, ", "))
+		}
+	}
+
+	// Down managed devices; the conf files mark the managed set.
+	managed := 0
+	entries, err := os.ReadDir(confDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	for _, e := range entries {
+		name := strings.TrimSuffix(e.Name(), ".conf")
+		if name == e.Name() {
+			continue
+		}
+		managed++
+		if wgctl.Exists(name) {
+			if err := requireRoot(); err != nil {
+				return err
+			}
+			if err := wgctl.Down(&store.Interface{Name: name}); err != nil {
+				return fmt.Errorf("bring %s down: %w", name, err)
+			}
+		}
+	}
+
+	// Wipe the whole state directory — it holds only wgmgt-generated files
+	// (confs, the local database, the controller state dir <conf-dir>/server
+	// with its PKI and database). The wholesale removal is guarded: it only
+	// happens when the directory is recognizably ours (default layout with
+	// the database inside, or literally named "wgmgt"); exotic --conf-dir
+	// values get the targeted cleanup instead.
+	if stateDirIsOurs() {
+		if err := os.RemoveAll(confDir); err != nil {
+			return fmt.Errorf("remove %s: %w", confDir, err)
+		}
+	} else {
+		for _, e := range entries {
+			if name := strings.TrimSuffix(e.Name(), ".conf"); name != e.Name() {
+				if err := os.Remove(filepath.Join(confDir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+					fmt.Fprintf(cmd.OutOrStderr(), "warning: could not remove %s: %v\n", e.Name(), err)
+				}
+			}
+		}
+		if err := os.RemoveAll(filepath.Join(confDir, "server")); err != nil {
+			return fmt.Errorf("remove %s: %w", filepath.Join(confDir, "server"), err)
+		}
+	}
+	// The database can live outside conf-dir via --db.
+	if filepath.Dir(dbPath) != confDir {
+		for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove %s: %w", p, err)
+			}
+		}
+	}
+	fmt.Fprintf(out, "Wiped %d managed interface(s) and the whole state directory %s — regenerating\n", managed, confDir)
+	return nil
+}
+
+// stateDirIsOurs guards the wholesale RemoveAll of conf-dir: the default
+// layout keeps the database inside it, and the default directory is
+// literally named wgmgt.
+func stateDirIsOurs() bool {
+	return filepath.Base(confDir) == "wgmgt" || filepath.Dir(dbPath) == confDir
+}
+
+// killWgmgtProcs stops every other running wgmgt process (server, agent,
+// web console). A full reset must kill them first: they hold certificates
+// and database state in memory and would keep serving deleted files — or,
+// for a local agent, re-apply the config being wiped. Returns the stopped
+// PIDs plus any that reappeared right afterwards (a service manager with a
+// restart policy); respawn is reported, not fought.
+func killWgmgtProcs() (stopped, respawned []string, err error) {
+	self := os.Getpid()
+	scan := func() []int {
+		entries, err := os.ReadDir("/proc")
+		if err != nil {
+			return nil
+		}
+		var pids []int
+		for _, e := range entries {
+			pid, err := strconv.Atoi(e.Name())
+			if err != nil || pid == self {
+				continue
+			}
+			comm, err := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
+			if err == nil && strings.TrimSpace(string(comm)) == "wgmgt" {
+				pids = append(pids, pid)
+			}
+		}
+		return pids
+	}
+	pids := scan()
+	if len(pids) == 0 {
+		return nil, nil, nil
+	}
+	for _, pid := range pids {
+		if err := syscall.Kill(pid, syscall.SIGTERM); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return stopped, respawned, err
+		}
+		stopped = append(stopped, strconv.Itoa(pid))
+	}
+	// Grace period, then force whatever is still alive, then watch for
+	// respawns (systemd Restart=always, docker --restart).
+	time.Sleep(500 * time.Millisecond)
+	for _, pid := range pids {
+		if err := syscall.Kill(pid, 0); err == nil {
+			syscall.Kill(pid, syscall.SIGKILL)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	for _, pid := range scan() {
+		respawned = append(respawned, strconv.Itoa(pid))
+	}
+	return stopped, respawned, nil
 }
 
 // offerStopForeignWG warns about WireGuard devices that are up but not
