@@ -5,7 +5,6 @@ import (
 	"encoding/pem"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 	"github.com/gexqin/wgmgt/internal/app"
 	"github.com/gexqin/wgmgt/internal/certs"
 	"github.com/gexqin/wgmgt/internal/control"
+	"github.com/gexqin/wgmgt/internal/fileutil"
 	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/web"
 )
@@ -42,6 +42,15 @@ var serverCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := requireRoot(); err != nil {
 			return err
+		}
+		if _, _, err := net.SplitHostPort(serverFlags.api); err != nil {
+			return fmt.Errorf("invalid --api address: %w", err)
+		}
+		if serverFlags.webPort < 1 || serverFlags.webPort > 65535 {
+			return fmt.Errorf("invalid --web port %d", serverFlags.webPort)
+		}
+		if serverFlags.pollHold < 0 || serverFlags.pollHold >= 60*time.Second {
+			return fmt.Errorf("--poll-hold must be between 0 and 60s (exclusive)")
 		}
 		dir := serverFlags.dir
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -99,13 +108,14 @@ var serverCmd = &cobra.Command{
 			webHost = "0.0.0.0"
 		}
 		webAddr := net.JoinHostPort(webHost, strconv.Itoa(serverFlags.webPort))
+		webHTTP := webSrv.HTTPServer(webAddr)
 
 		errCh := make(chan error, 2)
 		go func() {
 			errCh <- apiSrv.ListenAndServeTLS(filepath.Join(dir, "server.pem"), filepath.Join(dir, "server.key"))
 		}()
 		go func() {
-			errCh <- http.ListenAndServe(webAddr, webSrv.Handler())
+			errCh <- webHTTP.ListenAndServe()
 		}()
 
 		out := cmd.OutOrStderr()
@@ -131,6 +141,7 @@ var serverCmd = &cobra.Command{
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = apiSrv.Shutdown(ctx)
+			_ = webHTTP.Shutdown(ctx)
 			return nil
 		case err := <-errCh:
 			return err
@@ -144,6 +155,9 @@ var serverEnrollCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
+		if !store.ValidClientName(name) {
+			return fmt.Errorf("invalid client name %q: must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$", name)
+		}
 		dir := serverFlags.dir
 		ca, err := certs.LoadOrNewCA(dir)
 		if err != nil {
@@ -160,13 +174,13 @@ var serverEnrollCmd = &cobra.Command{
 		certPath := filepath.Join(outDir, name+".pem")
 		keyPath := filepath.Join(outDir, name+".key")
 		caPath := filepath.Join(outDir, "ca.pem")
-		if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+		if err := fileutil.WriteAtomic(certPath, certPEM, 0o644); err != nil {
 			return err
 		}
-		if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		if err := fileutil.WriteAtomic(keyPath, keyPEM, 0o600); err != nil {
 			return err
 		}
-		if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Cert.Raw}), 0o644); err != nil {
+		if err := fileutil.WriteAtomic(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Cert.Raw}), 0o644); err != nil {
 			return err
 		}
 
@@ -202,6 +216,9 @@ var serverTokenCmd = &cobra.Command{
 		if !store.ValidClientName(name) {
 			return fmt.Errorf("invalid client name %q: must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$ (it becomes a URL path and a certificate CN)", name)
 		}
+		if tokenFlags.ttl <= 0 || tokenFlags.ttl > 30*24*time.Hour {
+			return fmt.Errorf("--ttl must be greater than zero and no more than 30 days")
+		}
 		dir := serverFlags.dir
 		ca, err := certs.LoadOrNewCA(dir)
 		if err != nil {
@@ -212,6 +229,7 @@ var serverTokenCmd = &cobra.Command{
 			return err
 		}
 		defer st.Close()
+		existing, _ := st.GetClient(name)
 		if err := st.EnsureClientPending(name); err != nil {
 			return err
 		}
@@ -223,8 +241,12 @@ var serverTokenCmd = &cobra.Command{
 		out := cmd.OutOrStdout()
 		fmt.Fprintf(out, "One-time enrollment token for %q (valid %s, single use):\n  %s\n", name, tokenFlags.ttl, token)
 		fmt.Fprintf(out, "\nOn the client run:\n")
-		fmt.Fprintf(out, "  sudo wgmgt agent --server %s --token %s --ca-hash sha256:%s\n",
-			advertise, token, ca.CAFingerprint())
+		force := ""
+		if existing != nil && existing.Fingerprint != "" {
+			force = " --force-enroll"
+		}
+		fmt.Fprintf(out, "  sudo wgmgt agent --server %s --token %s --ca-hash sha256:%s%s\n",
+			advertise, token, ca.CAFingerprint(), force)
 		return nil
 	},
 }

@@ -82,15 +82,14 @@ func TestQuarantinePersistsAcrossRestart(t *testing.T) {
 
 func TestQuarantineRejectsOnlyTheBadVersion(t *testing.T) {
 	// Mirrors the gate in PollOnce: quarantined at v7 means exactly v7 stays
-	// rejected. Not <=: versions can DROP (deleting the top-version
-	// interface lowers the client's MAX), and a fixed config must be allowed
-	// to carry a lower number — otherwise the client never recovers.
+	// rejected. Not <=: a controller database restore may restart revisions,
+	// and a freshly enrolled client must still be able to recover.
 	a := &Agent{quarantinedVer: 7}
 	rejected := func(v int64) bool { return v == a.quarantinedVer }
 	if !rejected(7) {
 		t.Error("the quarantined version must be rejected")
 	}
 	if rejected(6) || rejected(8) {
-		t.Error("other versions must be allowed (lower included — versions can drop)")
+		t.Error("other revisions must be allowed, including after a controller reset")
 	}
 }

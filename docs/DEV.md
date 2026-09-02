@@ -69,16 +69,16 @@ wgmgt/
   证书 CN 即客户端名;请求体带 `since`(已应用的配置版本)+ 实时状态。
   `since` 等于当前版本时服务端挂起至多 `--poll-hold`(默认 25s,0 关闭),
   直到版本变化(store 变更钩子经 Notifier 即时唤醒)、hold 到期或客户端
-  断开;版本**不同**时(注意不是"更新"——删除接口会使版本**下降**)
+  断开;版本**不同**时(也覆盖控制端数据库恢复后修订号回退的情况)
   响应携带完整期望配置,否则只回版本号(几百字节)。agent 每轮完成即
   立即重发(请求本身就是定时器),失败按 `--interval` 退避;状态随每轮
   长轮询上报,节奏 ≈ hold。进程外直改 DB 不触发钩子,一个 hold 周期内
   自愈。
-- **配置版本**:`interfaces.config_version` 每次变更 +1,客户端版本取其
-  接口的最大值。agent 只在版本变化时重新应用(避免重置 peer
-  流量计数器)。
-- **agent 无状态**:唯一本地痕迹是 conf 目录(也作为"受管接口集合"
-  的记录,重启后据此上报状态)。
+- **配置修订号**:`config_revisions` 为每个客户端维护单调递增值;
+  interface 新增、修改、删除都由 SQLite trigger 推进。agent 只在
+  修订号变化时重新应用(避免无谓重置 peer 流量计数器)。
+- **agent 轻状态**:本地 conf 目录保存 mTLS 材料、生成的配置(也是
+  "受管接口集合")和自锁隔离修订号,重启后据此安全收敛。
 - **期望态模型**:控制台的 Enable/Disable 写 `enabled` 列并 bump 版本,
   agent 收敛(enabled→确保 up;disabled→删设备)。
 - **热更 vs 重建**:agent 按"路由签名"(地址/端口/MTU/是否含默认路由)
@@ -115,15 +115,17 @@ wgmgt/
   回调实现 pin(链中任一证书哈希 == pin,且叶子对该根做完整 Verify
   含主机名校验)。该 client 用**硬超时 30s**——注册没有长轮询,别抄
   poll client 的无超时模式。响应材料二次校验(pair 一致 + 证书由
-  返回的 CA 签发),落盘 conf-dir(0700,key 0600);重启时
-  `LoadMaterial` 命中即跳过注册。
+  返回的 CA 签发且返回 CA 哈希仍等于 pin),落盘 conf-dir(0700,key
+  0600);重启时 `LoadMaterial` 完整验签成功才跳过注册。重新注册命令
+  带 `--force-enroll`,明确替换已有材料。
 
 ## 全隧道与自锁回退(2026-08-27 补)
 
 - **策略路由**(wgctl):AllowedIPs 含 0/0 或 ::/0 时,wg-quick 同款
-  三件套——设备 fwmark(=表号)、默认路由进 table 51820、两条 rule
-  (`not fwmark → 51820` @32765,`main suppress_prefixlength 0` @32764)。
-  Down 时必须显式删 rule(路由随设备消失,rules 不会)。
+  三件套——设备 fwmark、默认路由进独立 table、两条 policy rule。
+  默认表号和 rule 优先级按接口名稳定派生,避免多个全隧道接口互删状态;
+  显式 Table/FwMark 仍会透传。Down 必须显式删 rule(路由随设备消失,
+  rules 不会)。
 - **验证式看门狗**(agent):应用新配置 → 下一轮成功 poll 即验证;
   `--verify-timeout`(默认 180s)内未验证 → teardown 全部受管接口 +
   隔离(该版本不再重试,直到更新的版本)。已验证配置不受控制端

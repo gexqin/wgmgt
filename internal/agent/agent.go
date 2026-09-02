@@ -5,12 +5,15 @@
 package agent
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,9 +25,14 @@ import (
 
 	"github.com/gexqin/wgmgt/internal/confgen"
 	"github.com/gexqin/wgmgt/internal/control"
+	"github.com/gexqin/wgmgt/internal/fileutil"
 	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/wgctl"
 )
+
+// ErrRevoked means the controller explicitly rejected this agent's identity.
+// It is not retried: the managed tunnels are removed before Run returns.
+var ErrRevoked = errors.New("agent enrollment revoked")
 
 // Agent polls the controller and applies config.
 type Agent struct {
@@ -80,6 +88,7 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeou
 			},
 		},
 		interval:      interval,
+		appliedVer:    -1,
 		verifyTimeout: verifyTimeout,
 		confDir:       confDir,
 	}
@@ -88,7 +97,8 @@ func New(serverURL string, caPEM, certPEM, keyPEM []byte, interval, verifyTimeou
 }
 
 // Run polls until the context is cancelled. The first poll happens
-// immediately (appliedVer 0 forces a full config fetch). Each successful
+// immediately (appliedVer -1 forces a full config fetch, including an empty
+// desired state at controller revision 0). Each successful
 // long-poll blocks for the server's hold time, so the request itself is the
 // sleep — the agent reconnects instantly, and config changes reach it in
 // milliseconds. The watchdog runs on a short side ticker so a locked-out
@@ -100,6 +110,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		start := time.Now()
 		err := a.PollOnce(ctx)
 		switch {
+		case errors.Is(err, ErrRevoked):
+			a.teardown(true)
+			return err
 		case err != nil:
 			log.Printf("agent: %v", err)
 			select {
@@ -153,7 +166,7 @@ func (a *Agent) checkWatchdog() {
 	}
 	log.Printf("agent: controller unreachable for %s after applying config v%d — rolling back WireGuard (quarantined until a newer version)",
 		a.verifyTimeout, a.appliedVer)
-	a.teardown()
+	a.teardown(false)
 	a.quarantinedVer = a.appliedVer
 	a.saveQuarantine(a.quarantinedVer)
 	a.verifying = false
@@ -164,8 +177,13 @@ func (a *Agent) checkWatchdog() {
 func (a *Agent) quarantinePath() string { return filepath.Join(a.confDir, ".quarantine") }
 
 func (a *Agent) saveQuarantine(version int64) {
-	os.MkdirAll(a.confDir, 0o700)
-	os.WriteFile(a.quarantinePath(), []byte(strconv.FormatInt(version, 10)), 0o600)
+	if err := os.MkdirAll(a.confDir, 0o700); err != nil {
+		log.Printf("agent: save quarantine: %v", err)
+		return
+	}
+	if err := fileutil.WriteAtomic(a.quarantinePath(), []byte(strconv.FormatInt(version, 10)), 0o600); err != nil {
+		log.Printf("agent: save quarantine: %v", err)
+	}
 }
 
 func (a *Agent) loadQuarantine() {
@@ -181,12 +199,14 @@ func (a *Agent) loadQuarantine() {
 
 func (a *Agent) clearQuarantine() {
 	a.quarantinedVer = 0
-	os.Remove(a.quarantinePath())
+	if err := os.Remove(a.quarantinePath()); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("agent: clear quarantine: %v", err)
+	}
 }
 
-// teardown stops every managed interface (conf files stay as the record
-// of the managed set; devices come back when a good config arrives).
-func (a *Agent) teardown() {
+// teardown stops every managed interface. Revocation also removes generated
+// conf files so a restarted process cannot treat stale desired state as live.
+func (a *Agent) teardown(removeConfs bool) {
 	entries, err := os.ReadDir(a.confDir)
 	if err != nil {
 		return
@@ -196,10 +216,57 @@ func (a *Agent) teardown() {
 		if name == e.Name() {
 			continue
 		}
-		if err := wgctl.Down(&store.Interface{Name: name}); err != nil {
+		ifc, err := ManagedInterfaceFromConf(filepath.Join(a.confDir, e.Name()), name)
+		if err != nil {
 			log.Printf("agent: rollback %s: %v", name, err)
+			if removeConfs {
+				if removeErr := os.Remove(filepath.Join(a.confDir, e.Name())); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+					log.Printf("agent: remove revoked config %s: %v", name, removeErr)
+				}
+			}
+			continue
+		}
+		if wgctl.Exists(name) {
+			if err := wgctl.Down(ifc); err != nil {
+				log.Printf("agent: rollback %s: %v", name, err)
+				continue
+			}
+		}
+		if removeConfs {
+			if err := os.Remove(filepath.Join(a.confDir, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Printf("agent: remove revoked config %s: %v", name, err)
+			}
+		}
+		delete(a.sigs, name)
+	}
+	if removeConfs {
+		a.clearQuarantine()
+	}
+}
+
+// ManagedInterfaceFromConf reads the ownership key from a WGMGT-generated
+// conf file. Destructive recovery paths use it to prove a device is ours.
+func ManagedInterfaceFromConf(confPath, name string) (*store.Interface, error) {
+	f, err := os.Open(confPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		key, value, ok := strings.Cut(scanner.Text(), "=")
+		if ok && strings.TrimSpace(key) == "PrivateKey" {
+			privateKey := strings.TrimSpace(value)
+			if privateKey == "" {
+				break
+			}
+			return &store.Interface{Name: name, PrivateKey: privateKey}, nil
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("generated config has no interface private key")
 }
 
 // PollOnce fetches new config (if any), applies it, and reports status.
@@ -218,6 +285,9 @@ func (a *Agent) PollOnce(ctx context.Context) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return fmt.Errorf("%w: poll answered %s", ErrRevoked, resp.Status)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("poll: %s", resp.Status)
 	}
@@ -225,16 +295,15 @@ func (a *Agent) PollOnce(ctx context.Context) error {
 		Version    int64                     `json:"version"`
 		Interfaces *[]control.AgentInterface `json:"interfaces"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&cfg); err != nil {
 		return err
 	}
 	if cfg.Interfaces != nil && *cfg.Interfaces != nil {
 		a.gotConfig = true
 		if a.quarantinedVer > 0 && cfg.Version == a.quarantinedVer {
 			// The config that locked us out is still current; stay down.
-			// Exactly equal, not <=: versions can drop (deleting the
-			// top-version interface lowers the client's MAX), and a fixed
-			// config must be allowed to carry a lower number.
+			// Exactly equal, not <=: a controller reset may restart revisions,
+			// and a freshly enrolled client must be allowed to recover.
 			a.appliedVer = cfg.Version
 		} else if err := a.Apply(*cfg.Interfaces); err != nil {
 			return fmt.Errorf("apply v%d: %w", cfg.Version, err)
@@ -257,18 +326,17 @@ func (a *Agent) PollOnce(ctx context.Context) error {
 }
 
 // ifaceSig captures everything about an interface that cannot be changed
-// by a hot peer update: address, port, MTU, and whether policy routing
-// (a default route) is engaged. A signature change requires a rebuild.
+// by a hot peer update: address, port, MTU, routing table/mark, and whether
+// policy routing (a default route) is engaged. A change requires a rebuild.
 type ifaceSig struct {
-	addr   string
-	port   int
-	mtu    int
-	policy bool
+	addr, table, fwmark string
+	port, mtu           int
+	policy              bool
 }
 
 func sigOf(ci control.AgentInterface) ifaceSig {
 	v4, v6 := wgctl.DefaultRouteFamilies(ci.Peers)
-	return ifaceSig{addr: ci.Address, port: ci.ListenPort, mtu: ci.MTU, policy: v4 || v6}
+	return ifaceSig{addr: ci.Address, port: ci.ListenPort, mtu: ci.MTU, table: ci.RouteTable, fwmark: ci.Fwmark, policy: v4 || v6}
 }
 
 // Apply converges the client to the desired state: enabled interfaces up
@@ -279,9 +347,13 @@ func (a *Agent) Apply(cfg []control.AgentInterface) error {
 	if err := os.MkdirAll(a.confDir, 0o700); err != nil {
 		return err
 	}
+	if err := os.Chmod(a.confDir, 0o700); err != nil {
+		return fmt.Errorf("secure conf directory: %w", err)
+	}
 	if a.sigs == nil {
 		a.sigs = map[string]ifaceSig{}
 	}
+	desired := make(map[string]bool, len(cfg))
 	for _, ci := range cfg {
 		// Defense in depth: the controller validates names too, but the
 		// conf-file writes below turn names into paths, so an agent never
@@ -289,23 +361,34 @@ func (a *Agent) Apply(cfg []control.AgentInterface) error {
 		if !store.ValidIfaceName(ci.Name) {
 			return fmt.Errorf("invalid interface name %q from controller", ci.Name)
 		}
+		desired[ci.Name] = true
 		ifc := &store.Interface{
 			Name: ci.Name, PrivateKey: ci.PrivateKey, ListenPort: ci.ListenPort,
-			Address: ci.Address, MTU: ci.MTU, PostUp: ci.PostUp, PostDown: ci.PostDown,
+			Address: ci.Address, MTU: ci.MTU, DNS: ci.DNS, RouteTable: ci.RouteTable,
+			Fwmark: ci.Fwmark, PostUp: ci.PostUp, PostDown: ci.PostDown,
 		}
 		path := filepath.Join(a.confDir, ci.Name+".conf")
+		downIfc := ifc
+		if wgctl.Exists(ci.Name) {
+			if old, err := ManagedInterfaceFromConf(path, ci.Name); err == nil {
+				old.PostDown = ifc.PostDown
+				downIfc = old
+			}
+		}
 		if !ci.Enabled {
-			os.Remove(path)
-			delete(a.sigs, ci.Name)
 			if wgctl.Exists(ci.Name) {
-				if err := wgctl.Down(ifc); err != nil {
+				if err := wgctl.Down(downIfc); err != nil {
 					return fmt.Errorf("down %s: %w", ci.Name, err)
 				}
 			}
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove disabled config %s: %w", ci.Name, err)
+			}
+			delete(a.sigs, ci.Name)
 			continue
 		}
 		// Conf first (also marks the interface as managed), then netlink.
-		if err := os.WriteFile(path, []byte(confgen.Interface(ifc, ci.Peers)), 0o600); err != nil {
+		if err := fileutil.WriteAtomic(path, []byte(confgen.Interface(ifc, ci.Peers)), 0o600); err != nil {
 			return fmt.Errorf("write %s: %w", path, err)
 		}
 		sig := sigOf(ci)
@@ -315,7 +398,7 @@ func (a *Agent) Apply(cfg []control.AgentInterface) error {
 		// outlived the agent process.
 		if !wgctl.Exists(ci.Name) || !known || prev != sig {
 			if wgctl.Exists(ci.Name) {
-				if err := wgctl.Down(ifc); err != nil {
+				if err := wgctl.Down(downIfc); err != nil {
 					return fmt.Errorf("rebuild down %s: %w", ci.Name, err)
 				}
 			}
@@ -326,6 +409,37 @@ func (a *Agent) Apply(cfg []control.AgentInterface) error {
 		} else if err := wgctl.ApplyPeers(ifc, ci.Peers); err != nil {
 			return fmt.Errorf("apply peers %s: %w", ci.Name, err)
 		}
+	}
+	return a.removeAbsent(desired)
+}
+
+func (a *Agent) removeAbsent(desired map[string]bool) error {
+	entries, err := os.ReadDir(a.confDir)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		name := strings.TrimSuffix(e.Name(), ".conf")
+		if name == e.Name() || desired[name] {
+			continue
+		}
+		if !store.ValidIfaceName(name) {
+			return fmt.Errorf("refusing to remove invalid managed interface name %q", name)
+		}
+		path := filepath.Join(a.confDir, e.Name())
+		ifc, err := ManagedInterfaceFromConf(path, name)
+		if err != nil {
+			return fmt.Errorf("read stale config %s: %w", name, err)
+		}
+		if wgctl.Exists(name) {
+			if err := wgctl.Down(ifc); err != nil {
+				return fmt.Errorf("remove stale interface %s: %w", name, err)
+			}
+		}
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale config %s: %w", name, err)
+		}
+		delete(a.sigs, name)
 	}
 	return nil
 }

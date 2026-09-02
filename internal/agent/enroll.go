@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/gexqin/wgmgt/internal/control"
+	"github.com/gexqin/wgmgt/internal/fileutil"
 )
 
 // Filenames of the persisted enrollment material inside confDir. The conf
@@ -34,7 +35,8 @@ const (
 )
 
 // LoadMaterial returns the persisted mTLS material from dir (ok=false when
-// any of the files is missing) — the skip-enrollment path on restarts.
+// any file is missing or the key/certificate/CA relationship is invalid) —
+// the skip-enrollment path on restarts.
 func LoadMaterial(dir string) (caPEM, certPEM, keyPEM []byte, ok bool) {
 	var err error
 	if caPEM, err = os.ReadFile(filepath.Join(dir, materialCA)); err != nil {
@@ -44,6 +46,27 @@ func LoadMaterial(dir string) (caPEM, certPEM, keyPEM []byte, ok bool) {
 		return nil, nil, nil, false
 	}
 	if keyPEM, err = os.ReadFile(filepath.Join(dir, materialKey)); err != nil {
+		return nil, nil, nil, false
+	}
+	caBlock, _ := pem.Decode(caPEM)
+	if caBlock == nil {
+		return nil, nil, nil, false
+	}
+	ca, err := x509.ParseCertificate(caBlock.Bytes)
+	if err != nil || !ca.IsCA {
+		return nil, nil, nil, false
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil || len(pair.Certificate) == 0 {
+		return nil, nil, nil, false
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return nil, nil, nil, false
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
 		return nil, nil, nil, false
 	}
 	return caPEM, certPEM, keyPEM, true
@@ -89,9 +112,9 @@ func Enroll(ctx context.Context, serverURL, token, caHash, confDir string) (caPE
 			TLSClientConfig: &tls.Config{
 				// InsecureSkipVerify alone would accept any server; the
 				// callback below restores trust by pinning the root CA.
-				InsecureSkipVerify:   true,
-				MinVersion:           tls.VersionTLS12,
-				VerifyPeerCertificate: verifyPinnedCA(pin, host),
+				InsecureSkipVerify: true, // #nosec G402 -- VerifyConnection below performs pinned CA, chain, and hostname verification.
+				MinVersion:         tls.VersionTLS12,
+				VerifyConnection:   verifyPinnedCA(pin, host),
 			},
 		},
 	}
@@ -132,6 +155,12 @@ func Enroll(ctx context.Context, serverURL, token, caHash, confDir string) (caPE
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("enroll response CA: %v", err)
 	}
+	if sum := sha256.Sum256(caCert.Raw); !bytes.Equal(sum[:], pin) {
+		return nil, nil, nil, errors.New("enroll response CA does not match --ca-hash")
+	}
+	if !caCert.IsCA {
+		return nil, nil, nil, errors.New("enroll response CA is not a certificate authority")
+	}
 	certBlock, _ := pem.Decode(certPEM)
 	if certBlock == nil {
 		return nil, nil, nil, errors.New("enroll response: certificate is not valid PEM")
@@ -150,13 +179,16 @@ func Enroll(ctx context.Context, serverURL, token, caHash, confDir string) (caPE
 	if err := os.MkdirAll(confDir, 0o700); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := os.WriteFile(filepath.Join(confDir, materialCA), caPEM, 0o644); err != nil {
+	if err := os.Chmod(confDir, 0o700); err != nil {
+		return nil, nil, nil, fmt.Errorf("secure conf directory: %w", err)
+	}
+	if err := fileutil.WriteAtomic(filepath.Join(confDir, materialCA), caPEM, 0o644); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := os.WriteFile(filepath.Join(confDir, materialCert), certPEM, 0o644); err != nil {
+	if err := fileutil.WriteAtomic(filepath.Join(confDir, materialCert), certPEM, 0o644); err != nil {
 		return nil, nil, nil, err
 	}
-	if err := os.WriteFile(filepath.Join(confDir, materialKey), keyPEM, 0o600); err != nil {
+	if err := fileutil.WriteAtomic(filepath.Join(confDir, materialKey), keyPEM, 0o600); err != nil {
 		return nil, nil, nil, err
 	}
 	return caPEM, certPEM, keyPEM, nil
@@ -175,20 +207,14 @@ func parseCAHash(s string) ([]byte, error) {
 
 // verifyPinnedCA builds the TLS verification callback: some presented
 // certificate must hash to the pin, and the leaf must verify (signature and
-// hostname) against that pinned root.
-func verifyPinnedCA(pin []byte, host string) func([][]byte, [][]*x509.Certificate) error {
-	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-		if len(rawCerts) == 0 {
+// hostname) against that pinned root. VerifyConnection also runs for resumed
+// TLS sessions, unlike VerifyPeerCertificate.
+func verifyPinnedCA(pin []byte, host string) func(tls.ConnectionState) error {
+	return func(state tls.ConnectionState) error {
+		if len(state.PeerCertificates) == 0 {
 			return errors.New("server presented no certificate")
 		}
-		certs := make([]*x509.Certificate, 0, len(rawCerts))
-		for _, raw := range rawCerts {
-			c, err := x509.ParseCertificate(raw)
-			if err != nil {
-				return fmt.Errorf("server certificate: %v", err)
-			}
-			certs = append(certs, c)
-		}
+		certs := state.PeerCertificates
 		var root *x509.Certificate
 		for _, c := range certs {
 			if sum := sha256.Sum256(c.Raw); bytes.Equal(sum[:], pin) {
@@ -202,15 +228,22 @@ func verifyPinnedCA(pin []byte, host string) func([][]byte, [][]*x509.Certificat
 			return fmt.Errorf("server CA does not match --ca-hash (got %x…, want %x…): is the controller address or the hash stale?",
 				sum[:8], pin[:8])
 		}
-		if root.Equal(certs[0]) { // the pinned cert IS the leaf
-			return nil
+		if !root.IsCA {
+			return errors.New("pinned certificate is not a CA")
 		}
 		pool := x509.NewCertPool()
 		pool.AddCert(root)
+		intermediates := x509.NewCertPool()
+		for _, cert := range certs[1:] {
+			if !cert.Equal(root) {
+				intermediates.AddCert(cert)
+			}
+		}
 		if _, err := certs[0].Verify(x509.VerifyOptions{
-			Roots:   pool,
-			DNSName: host,
-			KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+			Roots:         pool,
+			Intermediates: intermediates,
+			DNSName:       host,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		}); err != nil {
 			return fmt.Errorf("server certificate does not verify against the pinned CA: %v", err)
 		}

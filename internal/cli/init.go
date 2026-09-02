@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
+	"github.com/gexqin/wgmgt/internal/agent"
 	"github.com/gexqin/wgmgt/internal/certs"
 	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/wgctl"
@@ -57,7 +58,7 @@ var initCmd = &cobra.Command{
 		}
 		// Closure, not `defer st.Close()`: the re-init path replaces st with
 		// a fresh store after wiping the old one.
-		defer func() { st.Close() }()
+		defer func() { _ = st.Close() }()
 
 		if err := offerStopForeignWG(cmd, st); err != nil {
 			return err
@@ -80,7 +81,9 @@ var initCmd = &cobra.Command{
 			}
 			// Full reset: wipe devices, conf files, the database and the
 			// controller PKI so everything regenerates from scratch.
-			st.Close()
+			if err := st.Close(); err != nil {
+				return fmt.Errorf("close store before reset: %w", err)
+			}
 			if err := resetAll(cmd); err != nil {
 				return err
 			}
@@ -106,6 +109,9 @@ var initCmd = &cobra.Command{
 		}
 		if port < 0 || port > 65535 {
 			return fmt.Errorf("invalid port %d", port)
+		}
+		if initFlags.mtu != 0 && (initFlags.mtu < 576 || initFlags.mtu > 65535) {
+			return fmt.Errorf("invalid MTU %d (use 0 or 576..65535)", initFlags.mtu)
 		}
 
 		key, err := wgtypes.GeneratePrivateKey()
@@ -277,7 +283,11 @@ func resetAll(cmd *cobra.Command) error {
 			if err := requireRoot(); err != nil {
 				return err
 			}
-			if err := wgctl.Down(&store.Interface{Name: name}); err != nil {
+			ifc, err := agent.ManagedInterfaceFromConf(filepath.Join(confDir, e.Name()), name)
+			if err != nil {
+				return fmt.Errorf("read ownership key for %s: %w", name, err)
+			}
+			if err := wgctl.Down(ifc); err != nil {
 				return fmt.Errorf("bring %s down: %w", name, err)
 			}
 		}
@@ -365,7 +375,9 @@ func killWgmgtProcs() (stopped, respawned []string, err error) {
 	time.Sleep(500 * time.Millisecond)
 	for _, pid := range pids {
 		if err := syscall.Kill(pid, 0); err == nil {
-			syscall.Kill(pid, syscall.SIGKILL)
+			if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return stopped, respawned, err
+			}
 		}
 	}
 	time.Sleep(300 * time.Millisecond)

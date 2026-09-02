@@ -3,7 +3,6 @@ package cli
 import (
 	"fmt"
 	"net"
-	"net/http"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -39,12 +38,15 @@ var webCmd = &cobra.Command{
 		if webFlags.global {
 			host = "0.0.0.0"
 		}
+		if webFlags.port < 1 || webFlags.port > 65535 {
+			return fmt.Errorf("invalid web port %d", webFlags.port)
+		}
 		listen := net.JoinHostPort(host, strconv.Itoa(webFlags.port))
 		fmt.Fprintf(cmd.OutOrStderr(), "WGMGT web UI: %s\n", srv.URL(listen))
 		if webFlags.global {
 			fmt.Fprintf(cmd.OutOrStderr(), "WARNING: PLAIN HTTP on all interfaces — the URL token (and every client\nconf it serves, private keys included) is readable on the path. Prefer\nloopback + SSH tunnel, or a TLS reverse proxy.\n")
 		}
-		return http.ListenAndServe(listen, srv.Handler())
+		return srv.HTTPServer(listen).ListenAndServe()
 	},
 }
 

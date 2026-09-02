@@ -4,6 +4,7 @@
 package app
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gexqin/wgmgt/internal/confgen"
+	"github.com/gexqin/wgmgt/internal/fileutil"
 	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/wgctl"
 )
@@ -36,8 +38,11 @@ func (a *App) SyncConf(name string) error {
 	if err := os.MkdirAll(a.ConfDir, 0o700); err != nil {
 		return err
 	}
+	if err := os.Chmod(a.ConfDir, 0o700); err != nil {
+		return fmt.Errorf("secure conf directory: %w", err)
+	}
 	path := filepath.Join(a.ConfDir, name+".conf")
-	if err := os.WriteFile(path, []byte(confgen.Interface(ifc, peers)), 0o600); err != nil {
+	if err := fileutil.WriteAtomic(path, []byte(confgen.Interface(ifc, peers)), 0o600); err != nil {
 		return fmt.Errorf("write conf: %w", err)
 	}
 	if wgctl.Exists(name) {
@@ -66,14 +71,29 @@ func (a *App) NextFreeIP(ifc *store.Interface) (string, error) {
 	used := map[netip.Addr]bool{addr: true}
 	for _, p := range peers {
 		for _, s := range strings.Split(p.AllowedIPs, ",") {
-			if a2, err := netip.ParseAddr(strings.TrimSpace(strings.TrimSuffix(s, "/32"))); err == nil {
+			s = strings.TrimSpace(s)
+			if p2, err := netip.ParsePrefix(s); err == nil {
+				used[p2.Addr()] = true
+			} else if a2, err := netip.ParseAddr(s); err == nil {
 				used[a2] = true
 			}
 		}
 	}
-	base := addr.As4()
-	for i := 2; i < 255; i++ {
-		cand := netip.AddrFrom4([4]byte{base[0], base[1], base[2], byte(i)})
+	masked := prefix.Masked()
+	hostCount := uint64(1) << uint(32-masked.Bits())
+	if hostCount > 1<<20 {
+		return "", fmt.Errorf("tunnel subnet %s is too large for automatic assignment; specify an address", masked)
+	}
+	start, end := uint64(0), hostCount
+	if masked.Bits() <= 30 { // reserve the IPv4 network and broadcast addresses
+		start, end = 1, hostCount-1
+	}
+	network4 := masked.Addr().As4()
+	network := binary.BigEndian.Uint32(network4[:])
+	for offset := start; offset < end; offset++ {
+		var raw [4]byte
+		binary.BigEndian.PutUint32(raw[:], network+uint32(offset))
+		cand := netip.AddrFrom4(raw)
 		if !used[cand] {
 			return netip.PrefixFrom(cand, 32).String(), nil
 		}

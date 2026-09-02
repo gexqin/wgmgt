@@ -55,17 +55,20 @@ func Open(path string) (*Store, error) {
 	// serializes access and sidesteps SQLITE_BUSY entirely.
 	db.SetMaxOpenConns(1)
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	if err := migrate(db); err != nil {
-		db.Close()
+		_ = db.Close()
 		if errors.Is(err, ErrLegacySchema) {
 			return nil, fmt.Errorf("%w at %s: re-run `wgmgt init` and confirm the reset, or remove the file", err, path)
 		}
 		return nil, err
 	}
-	os.Chmod(path, 0o600) // best effort; may be read-only mounts
+	if err := os.Chmod(path, 0o600); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("secure database permissions: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -129,6 +132,28 @@ CREATE TABLE IF NOT EXISTS enroll_tokens (
   used_at    TEXT NOT NULL DEFAULT '' -- elsewhere do not sort with them
 );
 CREATE INDEX IF NOT EXISTS idx_enroll_tokens_client ON enroll_tokens(client);
+CREATE TABLE IF NOT EXISTS config_revisions (
+  client  TEXT PRIMARY KEY,
+  version INTEGER NOT NULL DEFAULT 0
+);
+INSERT INTO config_revisions (client, version)
+  SELECT client, MAX(config_version) FROM interfaces GROUP BY client
+  ON CONFLICT(client) DO NOTHING;
+CREATE TRIGGER IF NOT EXISTS interfaces_revision_insert
+AFTER INSERT ON interfaces BEGIN
+  INSERT INTO config_revisions (client, version) VALUES (NEW.client, 1)
+    ON CONFLICT(client) DO UPDATE SET version = version + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS interfaces_revision_update
+AFTER UPDATE ON interfaces BEGIN
+  INSERT INTO config_revisions (client, version) VALUES (NEW.client, 1)
+    ON CONFLICT(client) DO UPDATE SET version = version + 1;
+END;
+CREATE TRIGGER IF NOT EXISTS interfaces_revision_delete
+AFTER DELETE ON interfaces BEGIN
+  INSERT INTO config_revisions (client, version) VALUES (OLD.client, 1)
+    ON CONFLICT(client) DO UPDATE SET version = version + 1;
+END;
 `
 	_, err := db.Exec(ddl)
 	return err
@@ -173,7 +198,7 @@ type Client struct {
 
 // Interface is a managed WireGuard interface.
 type Interface struct {
-	Client           string `json:"client"`
+	Client         string `json:"client"`
 	Name           string `json:"name"`
 	PrivateKey     string `json:"private_key"`
 	ListenPort     int    `json:"listen_port"`
@@ -194,7 +219,7 @@ type Interface struct {
 // USAGE.md (DB is 0600 and already holds the server private key).
 type Peer struct {
 	ID               int64  `json:"id"`
-	Client             string `json:"client"`
+	Client           string `json:"client"`
 	Interface        string `json:"interface"`
 	Name             string `json:"name"`
 	PublicKey        string `json:"public_key"`
@@ -267,8 +292,7 @@ func (s *Store) DeleteInterface(client, name string) error {
 	if n, _ := res.RowsAffected(); n == 0 {
 		return fmt.Errorf("%w: interface %q", ErrNotFound, name)
 	}
-	// Deleting the top-version interface lowers the client's MAX version —
-	// still a config change agents must see.
+	// The deletion trigger advances the client-wide desired-state revision.
 	s.changed(client)
 	return nil
 }
@@ -285,9 +309,12 @@ func (s *Store) SetEnabled(client, name string, enabled bool) error {
 
 // UpdateServerEndpoint sets the public endpoint advertised in client confs.
 func (s *Store) UpdateServerEndpoint(client, name, endpoint string) error {
-	_, err := s.db.Exec("UPDATE interfaces SET server_endpoint = ?, config_version = config_version + 1 WHERE client = ? AND name = ?", endpoint, client, name)
+	res, err := s.db.Exec("UPDATE interfaces SET server_endpoint = ?, config_version = config_version + 1 WHERE client = ? AND name = ?", endpoint, client, name)
 	if err != nil {
 		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: interface %q", ErrNotFound, name)
 	}
 	s.changed(client)
 	return nil
@@ -295,7 +322,19 @@ func (s *Store) UpdateServerEndpoint(client, name, endpoint string) error {
 
 // AddPeer inserts a peer for the given interface.
 func (s *Store) AddPeer(p *Peer) error {
-	res, err := s.db.Exec(`INSERT INTO peers
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRow("SELECT COUNT(*) FROM peers WHERE client = ? AND interface = ? AND name = ?", p.Client, p.Interface, p.Name).Scan(&exists); err != nil {
+		return err
+	}
+	if exists != 0 {
+		return fmt.Errorf("peer name %q already exists on interface %q", p.Name, p.Interface)
+	}
+	res, err := tx.Exec(`INSERT INTO peers
 		(client, interface, name, public_key, client_private_key, preshared_key, allowed_ips, endpoint, keepalive)
 		VALUES (?,?,?,?,?,?,?,?,?)`,
 		p.Client, p.Interface, p.Name, p.PublicKey, p.ClientPrivateKey, p.PresharedKey, p.AllowedIPs, p.Endpoint, p.Keepalive)
@@ -303,7 +342,14 @@ func (s *Store) AddPeer(p *Peer) error {
 		return err
 	}
 	p.ID, _ = res.LastInsertId()
-	if err := s.bump(p.Client, p.Interface); err != nil {
+	res, err = tx.Exec("UPDATE interfaces SET config_version = config_version + 1 WHERE client = ? AND name = ?", p.Client, p.Interface)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: interface %q", ErrNotFound, p.Interface)
+	}
+	if err := tx.Commit(); err != nil {
 		return err
 	}
 	s.changed(p.Client)
@@ -359,22 +405,38 @@ func (s *Store) DeletePeer(client, iface, ref string) (*Peer, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.db.Exec("DELETE FROM peers WHERE id = ?", p.ID); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return nil, err
 	}
-	if err := s.bump(client, iface); err != nil {
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM peers WHERE id = ?", p.ID); err != nil {
+		return nil, err
+	}
+	res, err := tx.Exec("UPDATE interfaces SET config_version = config_version + 1 WHERE client = ? AND name = ?", client, iface)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, fmt.Errorf("%w: interface %q", ErrNotFound, iface)
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	s.changed(client)
 	return p, nil
 }
 
-// ConfigVersion returns the max config version of a client's interfaces
-// (0 when the client has none) — the number agents poll with.
+// ConfigVersion returns the client's monotonic desired-state revision. It is
+// separate from per-interface config_version so changes to any interface,
+// including deletion of the last one, always produce a distinct value.
 func (s *Store) ConfigVersion(client string) (int64, error) {
-	var v sql.NullInt64
-	err := s.db.QueryRow("SELECT MAX(config_version) FROM interfaces WHERE client = ?", client).Scan(&v)
-	return v.Int64, err
+	var v int64
+	err := s.db.QueryRow("SELECT version FROM config_revisions WHERE client = ?", client).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	return v, err
 }
 
 // --- client registry ---
@@ -423,8 +485,8 @@ func (s *Store) GetClient(name string) (*Client, error) {
 
 // DeleteClient removes a client and everything it owns: interfaces (peers go
 // with them via cascade), enrollment tokens, and the registry row. An
-// enrolled agent discovers this on its next poll (auth fails, client unknown)
-// and rolls itself back via its verify-timeout dead-man switch.
+// enrolled agent discovers this on its next poll and immediately removes its
+// managed devices and generated configurations.
 func (s *Store) DeleteClient(name string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -435,12 +497,17 @@ func (s *Store) DeleteClient(name string) error {
 		"DELETE FROM interfaces WHERE client = ?", // peers cascade
 		"DELETE FROM enroll_tokens WHERE client = ?",
 		"DELETE FROM clients WHERE name = ?",
+		"DELETE FROM config_revisions WHERE client = ?",
 	} {
 		if _, err := tx.Exec(q, name); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.changed(name)
+	return nil
 }
 
 // ValidIfaceName reports whether name is a safe Linux interface name.
@@ -456,6 +523,10 @@ var clientNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$`)
 
 func ValidClientName(name string) bool { return clientNameRe.MatchString(name) }
 
+// ValidPeerName reports whether a peer label is safe as a URL path element
+// and unambiguous within an interface.
+func ValidPeerName(name string) bool { return clientNameRe.MatchString(name) }
+
 // EnsureClientPending registers a client row without touching an existing
 // fingerprint (unlike EnsureClient, which overwrites it) — used when minting
 // an enrollment token so the dashboard can show the pending client.
@@ -469,7 +540,7 @@ func (s *Store) EnsureClientPending(name string) error {
 // EnrollToken is a one-time bootstrap token record. Only the hash is
 // stored; the plaintext exists solely at creation time.
 type EnrollToken struct {
-	Client      string
+	Client    string
 	CreatedAt string
 	ExpiresAt string
 	Used      bool
@@ -491,7 +562,7 @@ func (s *Store) CreateEnrollToken(client string, ttl time.Duration) (string, err
 		return "", err
 	}
 	// Lazy cleanup of tokens that expired unused more than a day ago.
-	s.db.Exec("DELETE FROM enroll_tokens WHERE expires_at < ?", now.Add(-24*time.Hour).Format(time.RFC3339))
+	_, _ = s.db.Exec("DELETE FROM enroll_tokens WHERE expires_at < ?", now.Add(-24*time.Hour).Format(time.RFC3339))
 	return token, nil
 }
 
@@ -562,12 +633,6 @@ func clientArgs(client string) []any {
 		return nil
 	}
 	return []any{client}
-}
-
-// bump increments the config version of an interface after any change,
-// so agents detect updates and conf regeneration can be ordered.
-func (s *Store) bump(client, iface string) error {
-	return s.bumpIf("UPDATE interfaces SET config_version = config_version + 1 WHERE client = ? AND name = ?", client, iface)
 }
 
 func (s *Store) bumpIf(q string, args ...any) error {

@@ -1,11 +1,11 @@
 {{define "content"}}
-<h1>Client conf <span class="muted">— {{.PeerName}} on {{.IfaceName}}</span></h1>
+<h1>Client conf <span class="muted">— {{.PeerName}} on {{.Iface.Name}}</span></h1>
 <p class="muted">Import into any WireGuard client. It contains a private key — treat it like a password.</p>
 <div class="conf-wrap">
   <pre id="conf">{{.Conf}}</pre>
   <button class="btn" id="copy-btn">Copy</button>
 </div>
-<p><a href="{{u "iface" .IfaceName}}">← back to {{.IfaceName}}</a></p>
+<p><a href="{{iu .Iface}}">← back to {{.Iface.Name}}</a></p>
 <script>
 document.getElementById('copy-btn').addEventListener('click', function () {
   var btn = this;

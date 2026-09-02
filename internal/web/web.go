@@ -17,6 +17,7 @@ import (
 	"html/template"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/netip"
 	"path"
@@ -118,6 +119,14 @@ func (s *Server) ifaceURL(ifc store.Interface, rest ...string) string {
 // Handler wraps the mux with the token check.
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		if r.Method == http.MethodPost {
+			r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+		}
 		p := r.URL.Path
 		if p == s.prefix {
 			http.Redirect(w, r, s.prefix+"/", http.StatusTemporaryRedirect)
@@ -130,6 +139,20 @@ func (s *Server) Handler() http.Handler {
 		r.URL.Path = "/" + strings.TrimPrefix(p, s.prefix+"/")
 		s.mux.ServeHTTP(w, r)
 	})
+}
+
+// HTTPServer returns a bounded web server. The token check happens after HTTP
+// parsing, so header/read timeouts are required even for unauthenticated peers.
+func (s *Server) HTTPServer(addr string) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 }
 
 func (s *Server) routes() {
@@ -257,7 +280,7 @@ func (s *Server) liveStatus(ifc *store.Interface) (bool, map[string]wgctl.PeerSt
 	}
 	live, err := wgctl.DeviceStatus(ifc.Name)
 	if err != nil {
-		log.Printf("device status %s: %v", ifc.Name, err)
+		log.Printf("device status %q: %v", ifc.Name, err)
 		return true, nil
 	}
 	return true, live
@@ -323,7 +346,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 		s.render(w, http.StatusOK, "dashboard.html", struct {
 			Controller bool
-			Clients      []clientCard
+			Clients    []clientCard
 		}{true, cards})
 		return
 	}
@@ -348,7 +371,7 @@ const enrollTokenTTL = 24 * time.Hour
 
 // enrollView is a freshly minted join command, shown exactly once.
 type enrollView struct {
-	Client    string
+	Client  string
 	Token   string
 	Command string
 	Expires time.Time
@@ -401,9 +424,16 @@ func (s *Server) handleClientToken(w http.ResponseWriter, r *http.Request) {
 // needed.
 func (s *Server) handleClientRm(w http.ResponseWriter, r *http.Request) {
 	client := r.PathValue("client")
+	if _, err := s.app.Store.GetClient(client); err != nil {
+		s.notFoundOrError(w, err)
+		return
+	}
 	if err := s.app.Store.DeleteClient(client); err != nil {
 		s.serverError(w, err)
 		return
+	}
+	if s.reports != nil {
+		s.reports.Delete(client)
 	}
 	http.Redirect(w, r, s.url(), http.StatusSeeOther)
 }
@@ -411,6 +441,11 @@ func (s *Server) handleClientRm(w http.ResponseWriter, r *http.Request) {
 // mintEnrollToken creates a one-time token for client and redirects to the
 // page that shows the join command exactly once.
 func (s *Server) mintEnrollToken(w http.ResponseWriter, r *http.Request, client string) {
+	registered, err := s.app.Store.GetClient(client)
+	if err != nil {
+		s.notFoundOrError(w, err)
+		return
+	}
 	token, err := s.app.Store.CreateEnrollToken(client, enrollTokenTTL)
 	if err != nil {
 		s.serverError(w, err)
@@ -421,14 +456,23 @@ func (s *Server) mintEnrollToken(w http.ResponseWriter, r *http.Request, client 
 		s.serverError(w, err)
 		return
 	}
+	force := ""
+	if registered.Fingerprint != "" {
+		force = " --force-enroll"
+	}
 	view := enrollView{
-		Client:    client,
+		Client:  client,
 		Token:   token,
-		Command: fmt.Sprintf("sudo wgmgt agent --server %s --token %s --ca-hash sha256:%s", s.apiURL, token, s.caHash),
+		Command: fmt.Sprintf("sudo wgmgt agent --server %s --token %s --ca-hash sha256:%s%s", s.apiURL, token, s.caHash, force),
 		Expires: time.Now().Add(enrollTokenTTL),
 	}
 	key := hex.EncodeToString(id)
 	s.enrollMu.Lock()
+	for oldKey, old := range s.enrollPend {
+		if time.Now().After(old.Expires) {
+			delete(s.enrollPend, oldKey)
+		}
+	}
 	s.enrollPend[key] = view
 	s.enrollMu.Unlock()
 	http.Redirect(w, r, s.url("enroll", key), http.StatusSeeOther)
@@ -446,11 +490,19 @@ func (s *Server) handleEnrollShow(w http.ResponseWriter, r *http.Request) {
 		s.render(w, http.StatusNotFound, "error.html", errorView{Code: 404, Message: "join command already viewed or expired — mint a new token"})
 		return
 	}
+	if time.Now().After(view.Expires) {
+		s.render(w, http.StatusNotFound, "error.html", errorView{Code: 404, Message: "join command expired — mint a new token"})
+		return
+	}
 	s.render(w, http.StatusOK, "enroll.html", view)
 }
 
 func (s *Server) handleClient(w http.ResponseWriter, r *http.Request) {
 	client := r.PathValue("client")
+	if _, err := s.app.Store.GetClient(client); err != nil {
+		s.notFoundOrError(w, err)
+		return
+	}
 	ifaces, err := s.app.Store.ListInterfaces(client)
 	if err != nil {
 		s.serverError(w, err)
@@ -478,7 +530,7 @@ func (s *Server) handleClient(w http.ResponseWriter, r *http.Request) {
 		tokenExpiry = toks[0].ExpiresAt
 	}
 	s.render(w, http.StatusOK, "client.html", struct {
-		Client        string
+		Client      string
 		Interfaces  []clientIface
 		Enrolled    bool
 		TokenExpiry string
@@ -506,6 +558,10 @@ func (s *Server) handlePeerQuickAdd(w http.ResponseWriter, r *http.Request) {
 // interface to a client.
 func (s *Server) handleIfaceCreate(w http.ResponseWriter, r *http.Request) {
 	client := r.PathValue("client")
+	if _, err := s.app.Store.GetClient(client); err != nil {
+		s.notFoundOrError(w, err)
+		return
+	}
 	if err := r.ParseForm(); err != nil {
 		s.badRequest(w, "bad form")
 		return
@@ -526,16 +582,29 @@ func (s *Server) handleIfaceCreate(w http.ResponseWriter, r *http.Request) {
 		s.badRequest(w, fmt.Sprintf("invalid address %q", address))
 		return
 	}
-	port, _ := strconv.Atoi(r.PostFormValue("port"))
-	if port == 0 {
-		port = 51820
+	portValue := strings.TrimSpace(r.PostFormValue("port"))
+	port := 51820
+	if portValue != "" {
+		var err error
+		port, err = strconv.Atoi(portValue)
+		if err != nil || port < 0 || port > 65535 {
+			s.badRequest(w, "listen port must be between 0 and 65535")
+			return
+		}
 	}
 	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		s.serverError(w, err)
 		return
 	}
-	mtu, _ := strconv.Atoi(r.PostFormValue("mtu"))
+	mtu := 0
+	if value := strings.TrimSpace(r.PostFormValue("mtu")); value != "" {
+		mtu, err = strconv.Atoi(value)
+		if err != nil || mtu < 576 || mtu > 65535 {
+			s.badRequest(w, "MTU must be between 576 and 65535, or empty for automatic")
+			return
+		}
+	}
 	ifc := &store.Interface{
 		Client: client, Name: name, PrivateKey: key.String(),
 		Address: address, ListenPort: port, MTU: mtu, Enabled: true,
@@ -626,8 +695,8 @@ func (s *Server) handlePeerAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	peerName := strings.TrimSpace(r.PostFormValue("name"))
-	if peerName == "" {
-		s.badRequest(w, "peer name is required")
+	if !store.ValidPeerName(peerName) {
+		s.badRequest(w, "invalid peer name (max 64 chars, starts with [a-zA-Z0-9], then [a-zA-Z0-9_.-])")
 		return
 	}
 
@@ -657,12 +726,22 @@ func (s *Server) handlePeerAdd(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, err)
 		return
 	}
+	endpoint := strings.TrimSpace(r.PostFormValue("endpoint"))
+	if err := validateEndpoint(endpoint); err != nil {
+		s.badRequest(w, "invalid peer endpoint: "+err.Error())
+		return
+	}
+	serverEndpoint := strings.TrimSpace(r.PostFormValue("server_endpoint"))
+	if err := validateEndpoint(serverEndpoint); err != nil {
+		s.badRequest(w, "invalid server endpoint: "+err.Error())
+		return
+	}
 	p := &store.Peer{
-		Client:       ifc.Client,
+		Client:     ifc.Client,
 		Interface:  ifc.Name,
 		Name:       peerName,
 		AllowedIPs: allowed,
-		Endpoint:   strings.TrimSpace(r.PostFormValue("endpoint")),
+		Endpoint:   endpoint,
 	}
 	if importedPub != "" {
 		p.PublicKey = importedPub
@@ -670,7 +749,12 @@ func (s *Server) handlePeerAdd(w http.ResponseWriter, r *http.Request) {
 		p.PublicKey = clientKey.PublicKey().String()
 		p.ClientPrivateKey = clientKey.String()
 	}
-	if ka, _ := strconv.Atoi(r.PostFormValue("keepalive")); ka > 0 {
+	if value := strings.TrimSpace(r.PostFormValue("keepalive")); value != "" {
+		ka, err := strconv.Atoi(value)
+		if err != nil || ka < 0 || ka > 65535 {
+			s.badRequest(w, "keepalive must be between 0 and 65535 seconds")
+			return
+		}
 		p.Keepalive = ka
 	}
 	if r.PostFormValue("preshared_key") != "" {
@@ -681,8 +765,8 @@ func (s *Server) handlePeerAdd(w http.ResponseWriter, r *http.Request) {
 		}
 		p.PresharedKey = psk.String()
 	}
-	if se := strings.TrimSpace(r.PostFormValue("server_endpoint")); se != "" && se != ifc.ServerEndpoint {
-		if err := s.app.Store.UpdateServerEndpoint(ifc.Client, ifc.Name, se); err != nil {
+	if serverEndpoint != "" && serverEndpoint != ifc.ServerEndpoint {
+		if err := s.app.Store.UpdateServerEndpoint(ifc.Client, ifc.Name, serverEndpoint); err != nil {
 			s.serverError(w, err)
 			return
 		}
@@ -745,7 +829,26 @@ func (s *Server) handlePeerConf(w http.ResponseWriter, r *http.Request) {
 		s.serverError(w, err)
 		return
 	}
-	s.render(w, http.StatusOK, "peerconf.html", struct{ IfaceName, PeerName, Conf string }{name, p.Name, conf})
+	s.render(w, http.StatusOK, "peerconf.html", struct {
+		Iface    store.Interface
+		PeerName string
+		Conf     string
+	}{*ifc, p.Name, conf})
+}
+
+func validateEndpoint(value string) error {
+	if value == "" {
+		return nil
+	}
+	host, portText, err := net.SplitHostPort(value)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return fmt.Errorf("must be host:port (IPv6 addresses need brackets)")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	return nil
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {

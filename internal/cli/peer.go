@@ -2,14 +2,16 @@ package cli
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
-	"os"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 
 	"github.com/gexqin/wgmgt/internal/confgen"
+	"github.com/gexqin/wgmgt/internal/fileutil"
 	"github.com/gexqin/wgmgt/internal/humanize"
 	"github.com/gexqin/wgmgt/internal/store"
 	"github.com/gexqin/wgmgt/internal/wgctl"
@@ -49,8 +51,17 @@ var peerAddCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if peerAddFlags.name == "" {
-			return fmt.Errorf("--name is required")
+		if !store.ValidPeerName(peerAddFlags.name) {
+			return fmt.Errorf("invalid --name %q: must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}$", peerAddFlags.name)
+		}
+		if peerAddFlags.keepalive < 0 || peerAddFlags.keepalive > 65535 {
+			return fmt.Errorf("--keepalive must be between 0 and 65535")
+		}
+		if err := validateCLIEndpoint(peerAddFlags.endpoint); err != nil {
+			return fmt.Errorf("invalid --endpoint: %w", err)
+		}
+		if err := validateCLIEndpoint(peerAddFlags.serverEndpoint); err != nil {
+			return fmt.Errorf("invalid --server-endpoint: %w", err)
 		}
 
 		allowedIPs := peerAddFlags.allowedIPs
@@ -130,7 +141,7 @@ var peerAddCmd = &cobra.Command{
 			return err
 		}
 		if peerAddFlags.output != "" {
-			if err := os.WriteFile(peerAddFlags.output, []byte(clientConf), 0o600); err != nil {
+			if err := fileutil.WriteAtomic(peerAddFlags.output, []byte(clientConf), 0o600); err != nil {
 				return fmt.Errorf("write client conf: %w", err)
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Client conf written to %s (chmod 600)\n", peerAddFlags.output)
@@ -140,6 +151,21 @@ var peerAddCmd = &cobra.Command{
 		fmt.Fprintf(cmd.OutOrStdout(), "# peer %q added (allowed IPs: %s)\n", p.Name, p.AllowedIPs)
 		return nil
 	},
+}
+
+func validateCLIEndpoint(value string) error {
+	if value == "" {
+		return nil
+	}
+	host, portText, err := net.SplitHostPort(value)
+	if err != nil || strings.TrimSpace(host) == "" {
+		return fmt.Errorf("must be host:port (IPv6 addresses need brackets)")
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("port must be between 1 and 65535")
+	}
+	return nil
 }
 
 var peerListCmd = &cobra.Command{

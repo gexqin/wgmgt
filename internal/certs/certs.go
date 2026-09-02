@@ -22,6 +22,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/gexqin/wgmgt/internal/fileutil"
 )
 
 // CA is the wgmgt certificate authority.
@@ -36,8 +38,12 @@ func NewCA() (*CA, error) {
 	if err != nil {
 		return nil, err
 	}
+	serial, err := randomSerial()
+	if err != nil {
+		return nil, err
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber:          randomSerial(),
+		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: "wgmgt-ca"},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().AddDate(10, 0, 0),
@@ -69,21 +75,30 @@ func LoadCA(dir string) (*CA, error) {
 	return parseCA(certPEM, keyPEM)
 }
 
-// Save writes ca.pem/ca.key into dir (0600).
+// Save writes ca.pem (0644) and ca.key (0600) into a private directory.
 func (ca *CA) Save(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "ca.pem"), pemCert(ca.Cert, "CERTIFICATE"), 0o644); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("secure PKI directory: %w", err)
+	}
+	if err := fileutil.WriteAtomic(filepath.Join(dir, "ca.pem"), pemCert(ca.Cert, "CERTIFICATE"), 0o644); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "ca.key"), pemKey(ca.Key), 0o600)
+	return fileutil.WriteAtomic(filepath.Join(dir, "ca.key"), pemKey(ca.Key), 0o600)
 }
 
 // LoadOrNewCA returns the CA in dir, creating it on first run. A ca.pem
 // without its key is a hard error, not a first run: silently regenerating
 // would invalidate every issued agent certificate (split brain).
 func LoadOrNewCA(dir string) (*CA, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("secure PKI directory: %w", err)
+	}
 	ca, err := LoadCA(dir)
 	if err == nil {
 		return ca, nil
@@ -156,8 +171,12 @@ func (ca *CA) issue(cn string, hosts []string, eku x509.ExtKeyUsage) (certPEM, k
 }
 
 func (ca *CA) issueForKey(cn string, hosts []string, eku x509.ExtKeyUsage, pub crypto.PublicKey) ([]byte, error) {
+	serial, err := randomSerial()
+	if err != nil {
+		return nil, err
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber: randomSerial(),
+		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: cn},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().AddDate(5, 0, 0),
@@ -215,14 +234,19 @@ func EnsureServerCerts(dir string, hosts []string) (tls.Certificate, *x509.CertP
 		if !errors.Is(err, os.ErrNotExist) {
 			return tls.Certificate{}, nil, err
 		}
+	} else if !validServerCertificate(cert, ca, hosts) {
+		cert = tls.Certificate{}
+		err = os.ErrNotExist
+	}
+	if err != nil {
 		certPEM, keyPEM, err := ca.NewServerCert(hosts)
 		if err != nil {
 			return tls.Certificate{}, nil, err
 		}
-		if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+		if err := fileutil.WriteAtomic(certPath, certPEM, 0o644); err != nil {
 			return tls.Certificate{}, nil, err
 		}
-		if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		if err := fileutil.WriteAtomic(keyPath, keyPEM, 0o600); err != nil {
 			return tls.Certificate{}, nil, err
 		}
 		cert, err = tls.X509KeyPair(certPEM, keyPEM)
@@ -274,10 +298,10 @@ func IssueServerCert(dir string, dnsNames, ips []string) (kept bool, err error) 
 	if err != nil {
 		return false, err
 	}
-	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+	if err := fileutil.WriteAtomic(certPath, certPEM, 0o644); err != nil {
 		return false, err
 	}
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+	if err := fileutil.WriteAtomic(keyPath, keyPEM, 0o600); err != nil {
 		return false, err
 	}
 	return false, nil
@@ -307,15 +331,42 @@ func sanCovers(leaf *x509.Certificate, dnsNames, ips []string) bool {
 	return true
 }
 
+func validServerCertificate(pair tls.Certificate, ca *CA, hosts []string) bool {
+	if len(pair.Certificate) == 0 {
+		return false
+	}
+	leaf, err := x509.ParseCertificate(pair.Certificate[0])
+	if err != nil {
+		return false
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(ca.Cert)
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}); err != nil {
+		return false
+	}
+	var dnsNames, ips []string
+	for _, host := range hosts {
+		if net.ParseIP(host) != nil {
+			ips = append(ips, host)
+		} else {
+			dnsNames = append(dnsNames, host)
+		}
+	}
+	return sanCovers(leaf, dnsNames, ips)
+}
+
 // --- helpers ---
 
-func randomSerial() *big.Int {
+func randomSerial() (*big.Int, error) {
 	limit := new(big.Int).Lsh(big.NewInt(1), 120)
 	n, err := rand.Int(rand.Reader, limit)
 	if err != nil {
-		return big.NewInt(1)
+		return nil, fmt.Errorf("generate certificate serial: %w", err)
 	}
-	return n
+	if n.Sign() == 0 {
+		n.SetInt64(1)
+	}
+	return n, nil
 }
 
 func pemCert(cert *x509.Certificate, typ string) []byte {
@@ -336,6 +387,16 @@ func parseCA(certPEM, keyPEM []byte) (*CA, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !cert.IsCA || !cert.BasicConstraintsValid {
+		return nil, errors.New("ca.pem: certificate is not a CA")
+	}
+	now := time.Now()
+	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+		return nil, errors.New("ca.pem: certificate is not currently valid")
+	}
+	if err := cert.CheckSignatureFrom(cert); err != nil {
+		return nil, fmt.Errorf("ca.pem: certificate is not self-signed: %w", err)
+	}
 	kb, _ := pem.Decode(keyPEM)
 	if kb == nil {
 		return nil, errors.New("ca.key: no PEM block")
@@ -343,6 +404,9 @@ func parseCA(certPEM, keyPEM []byte) (*CA, error) {
 	key, err := x509.ParseECPrivateKey(kb.Bytes)
 	if err != nil {
 		return nil, err
+	}
+	if !key.PublicKey.Equal(cert.PublicKey) {
+		return nil, errors.New("ca.key does not match ca.pem")
 	}
 	return &CA{Cert: cert, Key: key}, nil
 }

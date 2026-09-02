@@ -450,6 +450,10 @@ func TestPollVerifiesTimeIntervalSanity(t *testing.T) {
 	if r.Get("x").When.After(time.Now().Add(time.Minute)) {
 		t.Error("report timestamps must be sane")
 	}
+	r.Delete("x")
+	if !r.Get("x").When.IsZero() {
+		t.Error("deleted client status must not remain cached")
+	}
 }
 
 // newLongPollFixture builds a one-interface store + enrolled client + holding
@@ -520,39 +524,38 @@ func TestLongPollHoldExpiry(t *testing.T) {
 	}
 }
 
-func TestLongPollWakesOnVersionDrop(t *testing.T) {
+func TestLongPollWakesOnInterfaceDeletion(t *testing.T) {
 	st, c, url, _ := newLongPollFixture(t, 5*time.Second)
 
-	// A second interface at v1; wg0 has been bumped to v3 by peer churn.
+	// Every desired-state mutation advances the client-wide revision.
 	st.SetEnabled("n1", "wg0", false)
 	st.SetEnabled("n1", "wg0", true)
 	if err := st.CreateInterface(&store.Interface{Client: "n1", Name: "wg1", PrivateKey: "k", Address: "10.6.0.1/24", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	v, _ := st.ConfigVersion("n1")
-	if v != 3 {
-		t.Fatalf("setup: version = %d, want 3", v)
+	if v != 4 {
+		t.Fatalf("setup: version = %d, want 4", v)
 	}
 
-	ch := pollAsync(t, c, url, 3)
+	ch := pollAsync(t, c, url, v)
 	select {
 	case r := <-ch:
 		t.Fatalf("poll must be held at the current version, got %+v", r)
 	case <-time.After(150 * time.Millisecond):
 	}
 
-	// Deleting the top-version interface DROPS the client's MAX version; the
-	// poll must still wake and push (version "different", not "greater").
+	// Deletion also advances the client revision and wakes the poll.
 	if err := st.DeleteInterface("n1", "wg0"); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case r := <-ch:
-		if r.err != nil || r.resp.Version != 1 || r.resp.Interfaces == nil {
-			t.Fatalf("dropped-version poll: %+v", r)
+		if r.err != nil || r.resp.Version != 5 || r.resp.Interfaces == nil {
+			t.Fatalf("deletion poll: %+v", r)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("poll was not woken by the version drop")
+		t.Fatal("poll was not woken by interface deletion")
 	}
 }
 

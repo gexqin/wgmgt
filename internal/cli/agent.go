@@ -20,6 +20,7 @@ var agentFlags struct {
 	key           string
 	token         string
 	caHash        string
+	forceEnroll   bool
 	interval      time.Duration
 	verifyTimeout time.Duration
 	confDir       string
@@ -41,6 +42,9 @@ var agentCmd = &cobra.Command{
 		if err := requireRoot(); err != nil {
 			return err
 		}
+		if agentFlags.forceEnroll && agentFlags.token == "" {
+			return fmt.Errorf("--force-enroll requires --token")
+		}
 		var caPEM, certPEM, keyPEM []byte
 		if agentFlags.token != "" {
 			if cmd.Flags().Changed("cert") || cmd.Flags().Changed("key") {
@@ -52,7 +56,7 @@ var agentCmd = &cobra.Command{
 			var ok bool
 			// Restart safety: the token is burned, so reuse persisted
 			// material when it is already there.
-			if caPEM, certPEM, keyPEM, ok = agent.LoadMaterial(agentFlags.confDir); ok {
+			if caPEM, certPEM, keyPEM, ok = agent.LoadMaterial(agentFlags.confDir); ok && !agentFlags.forceEnroll {
 				fmt.Fprintf(cmd.OutOrStderr(), "wgmgt agent: found existing certificate material in %s; skipping enrollment\n", agentFlags.confDir)
 			} else {
 				var err error
@@ -98,6 +102,7 @@ func init() {
 	agentCmd.Flags().StringVar(&agentFlags.key, "key", "", "agent private key (with --token path: must not be set)")
 	agentCmd.Flags().StringVar(&agentFlags.token, "token", "", "one-time enrollment token (bootstrap path; requires --ca-hash)")
 	agentCmd.Flags().StringVar(&agentFlags.caHash, "ca-hash", "", "pinned controller CA fingerprint (sha256:<hex> or bare hex, from the join command)")
+	agentCmd.Flags().BoolVar(&agentFlags.forceEnroll, "force-enroll", false, "replace existing certificate material using the supplied one-time token")
 	agentCmd.Flags().DurationVar(&agentFlags.interval, "interval", 30*time.Second, "backoff between retries after a failed poll (normal cadence is server-driven long-polling)")
 	agentCmd.Flags().DurationVar(&agentFlags.verifyTimeout, "verify-timeout", 180*time.Second,
 		"dead-man switch: if the controller stays unreachable this long after a config change, roll back WireGuard (0 disables)")

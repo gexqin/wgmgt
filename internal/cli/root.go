@@ -48,6 +48,9 @@ func openStore() (*store.Store, error) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("secure state directory: %w", err)
+		}
 	}
 	return store.Open(dbPath)
 }

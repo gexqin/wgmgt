@@ -44,6 +44,9 @@ type AgentInterface struct {
 	ListenPort int          `json:"listen_port"`
 	Address    string       `json:"address"`
 	MTU        int          `json:"mtu"`
+	DNS        string       `json:"dns"`
+	RouteTable string       `json:"route_table"`
+	Fwmark     string       `json:"fwmark"`
 	Enabled    bool         `json:"enabled"`
 	PostUp     string       `json:"post_up"`
 	PostDown   string       `json:"post_down"`
@@ -103,6 +106,13 @@ func (rp *Reports) Get(client string) ReportEntry {
 	return rp.latest[client]
 }
 
+// Delete drops cached status when a client is removed.
+func (rp *Reports) Delete(client string) {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	delete(rp.latest, client)
+}
+
 // Notifier wakes hanging long-polls. Wake closes the client's current
 // generation channel; WakeCh lazily recreates it for the next waiter. The
 // capture-order rule that makes this race-free: a handler must grab WakeCh
@@ -149,8 +159,8 @@ type EnrollRequest struct {
 // the agent must use for subsequent mTLS polls, and the confirmed client name.
 type EnrollResponse struct {
 	Client string `json:"client"`
-	CA   string `json:"ca"`   // CA certificate PEM
-	Cert string `json:"cert"` // agent certificate PEM
+	CA     string `json:"ca"`   // CA certificate PEM
+	Cert   string `json:"cert"` // agent certificate PEM
 }
 
 // CertIssuer signs agent certificates during token enrollment. It is
@@ -242,6 +252,7 @@ func (a *API) Server(addr string, cert tls.Certificate, caPool *x509.CertPool) *
 		// long-poll responses. Header and idle times are still bounded.
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
 	}
 }
 
@@ -278,6 +289,10 @@ func (a *API) handleEnroll(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if !store.ValidClientName(client) {
+		http.Error(w, "invalid client name in enrollment record", http.StatusInternalServerError)
+		return
+	}
 	certPEM, err := a.issuer.NewAgentCertFromKey(client, []byte(req.PublicKey))
 	if err != nil {
 		// The token is already burned; the client needs a fresh one.
@@ -311,7 +326,7 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 	}
 	peerCert := r.TLS.PeerCertificates[0]
 	client := peerCert.Subject.CommonName
-	if client == "" || client == "wgmgt-ca" || client == "wgmgt-server" {
+	if !store.ValidClientName(client) || client == "wgmgt-ca" || client == "wgmgt-server" {
 		http.Error(w, "invalid client certificate", http.StatusUnauthorized)
 		return
 	}
@@ -330,13 +345,21 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req PollRequest
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if err := validateStatusReport(req.Status); err != nil {
+		http.Error(w, "bad status report: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	a.reports.Update(client, req.Status)
-	a.store.TouchClient(client, time.Now().UTC().Format(time.RFC3339))
+	if err := a.store.TouchClient(client, time.Now().UTC().Format(time.RFC3339)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	// Capture the wake channel BEFORE reading the version (see Notifier):
 	// changes racing this request are caught either by the channel close or
@@ -375,8 +398,8 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 		Interfaces *[]AgentInterface `json:"interfaces,omitempty"`
 	}{Version: version}
 
-	// "Different", not "greater": deleting the top-version interface lowers
-	// the client's MAX version, and that delete must reach the agent too.
+	// "Different", not "greater": a restored controller database may restart
+	// revisions, and that desired state must still reach the agent.
 	if version != req.Since {
 		cfg, err := a.configFor(client)
 		if err != nil {
@@ -389,6 +412,28 @@ func (a *API) handlePoll(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("poll response: %v", err)
 	}
+}
+
+func validateStatusReport(report StatusReport) error {
+	if len(report.Interfaces) > 128 {
+		return fmt.Errorf("too many interfaces")
+	}
+	peerCount := 0
+	for _, ifc := range report.Interfaces {
+		if !store.ValidIfaceName(ifc.Name) {
+			return fmt.Errorf("invalid interface name %q", ifc.Name)
+		}
+		peerCount += len(ifc.Peers)
+		if peerCount > 4096 {
+			return fmt.Errorf("too many peers")
+		}
+		for _, peer := range ifc.Peers {
+			if len(peer.PublicKey) > 128 || len(peer.Endpoint) > 512 {
+				return fmt.Errorf("peer status field too long")
+			}
+		}
+	}
+	return nil
 }
 
 // certFingerprint mirrors certs.Fingerprint without an import cycle.
@@ -436,7 +481,8 @@ func (a *API) configFor(client string) ([]AgentInterface, error) {
 		}
 		out = append(out, AgentInterface{
 			Name: ifc.Name, PrivateKey: ifc.PrivateKey, ListenPort: ifc.ListenPort,
-			Address: ifc.Address, MTU: ifc.MTU, Enabled: ifc.Enabled,
+			Address: ifc.Address, MTU: ifc.MTU, DNS: ifc.DNS,
+			RouteTable: ifc.RouteTable, Fwmark: ifc.Fwmark, Enabled: ifc.Enabled,
 			PostUp: ifc.PostUp, PostDown: ifc.PostDown, Peers: ps,
 		})
 	}

@@ -259,6 +259,24 @@ func TestConfigVersionPerClient(t *testing.T) {
 	if v, _ := s.ConfigVersion("n2"); v != 0 {
 		t.Errorf("n2 version = %d, want 0", v)
 	}
+	mustCreate(t, s, "n1", "wg1")
+	if v, _ := s.ConfigVersion("n1"); v != 2 {
+		t.Fatalf("n1 after second interface = %d, want 2", v)
+	}
+	// Mutating the older/lower per-interface version must still advance the
+	// client revision; taking MAX(config_version) used to miss this update.
+	if err := s.SetEnabled("n1", "wg0", false); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.ConfigVersion("n1"); v != 3 {
+		t.Errorf("n1 after wg0 mutation = %d, want 3", v)
+	}
+	if err := s.DeleteInterface("n1", "wg0"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := s.ConfigVersion("n1"); v != 4 {
+		t.Errorf("n1 after deletion = %d, want 4", v)
+	}
 }
 
 func TestChangeHookFires(t *testing.T) {
